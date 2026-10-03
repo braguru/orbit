@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+# Your network history: device names, usage and dropouts
+data/
+*.db
+*.db-wal
+*.db-shm
+# Output of the probe script: redacted, but it still has device names and local IPs
+scripts/probe_report.json
+.DS_Store
+# The Mac app build output
+mac/build/
+mac/.build/
+# Claude Code: per-person settings, and the worktrees its sessions make here
+.claude/settings.local.json
+.claude/worktrees/
