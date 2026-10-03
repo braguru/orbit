@@ -23,10 +23,20 @@ CREATE TABLE IF NOT EXISTS dish_minutes (
 CREATE TABLE IF NOT EXISTS outages (start_ms INTEGER PRIMARY KEY, duration_s REAL, cause TEXT, did_switch INTEGER);
 
 -- id is the router's client_id. The router only shows half of each MAC ("3A:51:DE:XX:XX:XX").
+-- allowance_alerted is the period and level already reported, like "2026-10-02|80".
 CREATE TABLE IF NOT EXISTS devices (
   id TEXT PRIMARY KEY, mac TEXT, first_seen INTEGER, last_seen INTEGER, router_name TEXT, hostname TEXT,
   custom_name TEXT, owner TEXT, type TEXT, acknowledged INTEGER DEFAULT 0, last_ip TEXT, last_iface TEXT,
-  last_domain TEXT, last_rx REAL, last_tx REAL, last_assoc_s REAL, last_poll REAL);
+  last_domain TEXT, last_rx REAL, last_tx REAL, last_assoc_s REAL, last_poll REAL,
+  notes TEXT, hidden INTEGER DEFAULT 0, allowance_bytes REAL, allowance_period TEXT, allowance_alerted TEXT);
+
+-- More client_ids for a device you merged: a phone that made up a new private address, or joined the guest
+-- Wi-Fi, gets a new client_id from the router. Their traffic counts for `device`. The last_* columns are
+-- that connection's own byte counters, like the ones in devices.
+CREATE TABLE IF NOT EXISTS device_aliases (
+  cid TEXT PRIMARY KEY, device TEXT, mac TEXT, router_name TEXT, hostname TEXT, first_seen INTEGER, last_seen INTEGER,
+  last_rx REAL, last_tx REAL, last_assoc_s REAL, last_poll REAL);
+CREATE INDEX IF NOT EXISTS device_aliases_device ON device_aliases(device);
 
 CREATE TABLE IF NOT EXISTS device_minutes (
   id TEXT, ts INTEGER, down_bytes REAL, up_bytes REAL, down_mbps_max REAL, up_mbps_max REAL, signal_avg REAL,
@@ -35,7 +45,9 @@ CREATE INDEX IF NOT EXISTS device_minutes_ts ON device_minutes(ts);
 
 CREATE TABLE IF NOT EXISTS device_days (id TEXT, day TEXT, down_bytes REAL, up_bytes REAL, PRIMARY KEY (id, day));
 
-CREATE TABLE IF NOT EXISTS people (id TEXT PRIMARY KEY, name TEXT, color TEXT, sort INTEGER);
+CREATE TABLE IF NOT EXISTS people (
+  id TEXT PRIMARY KEY, name TEXT, color TEXT, sort INTEGER,
+  allowance_bytes REAL, allowance_period TEXT, allowance_alerted TEXT);
 
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, cat TEXT, icon TEXT, title TEXT, detail TEXT, device TEXT, tone TEXT);
@@ -49,10 +61,19 @@ CREATE TABLE IF NOT EXISTS speedtests (
 CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, created INTEGER, last_seen INTEGER, label TEXT);
 """
 
+# Columns added after the first version. CREATE TABLE IF NOT EXISTS leaves an older table as it was.
+ADDED_COLUMNS = {
+    "devices": [("notes", "TEXT"), ("hidden", "INTEGER DEFAULT 0"), ("allowance_bytes", "REAL"),
+                ("allowance_period", "TEXT"), ("allowance_alerted", "TEXT")],
+    "people": [("allowance_bytes", "REAL"), ("allowance_period", "TEXT"), ("allowance_alerted", "TEXT")],
+}
+
 COLORS = ["blue", "orange", "green", "amber", "pink", "violet"]
 DEFAULT_PEOPLE = [("me", "Emmanuel", "blue"), ("family", "Family", "orange"),
                   ("home", "Smart home", "amber"), ("guests", "Guests", "pink")]
-DEVICE_FIELDS = {"custom_name", "owner", "type", "acknowledged"}
+ALLOWANCE_FIELDS = {"allowance_bytes", "allowance_period", "allowance_alerted"}
+DEVICE_FIELDS = {"custom_name", "owner", "type", "acknowledged", "notes", "hidden"} | ALLOWANCE_FIELDS
+PERSON_FIELDS = {"name"} | ALLOWANCE_FIELDS
 
 KEEP_SAMPLES_S = 2 * 86400
 KEEP_MINUTES_S = 400 * 86400
@@ -70,9 +91,14 @@ class Store:
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.execute("PRAGMA synchronous=NORMAL")
             self.db.executescript(SCHEMA)
+            for table, columns in ADDED_COLUMNS.items():
+                have = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
+                for name, decl in columns:
+                    if name not in have:
+                        self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
             if not self.db.execute("SELECT 1 FROM people LIMIT 1").fetchone():
                 for i, (pid, name, color) in enumerate(DEFAULT_PEOPLE):
-                    self.db.execute("INSERT INTO people VALUES (?,?,?,?)", (pid, name, color, i))
+                    self.db.execute("INSERT INTO people (id, name, color, sort) VALUES (?,?,?,?)", (pid, name, color, i))
 
     # ---------- helpers ----------
     def _all(self, sql, args=()):
@@ -95,6 +121,18 @@ class Store:
             self.db.execute("BEGIN")
             try:
                 self.db.executemany(sql, rows)
+                self.db.execute("COMMIT")
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
+
+    def _tx(self, statements):
+        """Run (sql, args) pairs as one transaction: all of them, or none."""
+        with self.lock:
+            self.db.execute("BEGIN")
+            try:
+                for sql, args in statements:
+                    self.db.execute(sql, args)
                 self.db.execute("COMMIT")
             except Exception:
                 self.db.execute("ROLLBACK")
@@ -184,11 +222,18 @@ class Store:
                   "VALUES (?,?,?,?,?,?,?)", (key, mac, int(now), int(now), router_name, hostname, acknowledged))
 
     def update_device(self, key, **fields):
-        bad = set(fields) - DEVICE_FIELDS
-        if bad:
-            raise ValueError(f"Can't change {', '.join(sorted(bad))}")
-        cols = ", ".join(f"{k}=?" for k in fields)
-        self._run(f"UPDATE devices SET {cols} WHERE id=?", (*fields.values(), key))
+        self.update_devices([(key, fields)])
+
+    def update_devices(self, changes):
+        """changes: [(id, {field: value})], saved together or not at all."""
+        statements = []
+        for key, fields in changes:
+            bad = set(fields) - DEVICE_FIELDS
+            if bad:
+                raise ValueError(f"Can't change {', '.join(sorted(bad))}")
+            cols = ", ".join(f"{k}=?" for k in fields)
+            statements.append((f"UPDATE devices SET {cols} WHERE id=?", (*fields.values(), key)))
+        self._tx(statements)
 
     def save_counters(self, rows):
         """rows: (rx, tx, assoc_s, poll_ts, last_seen, mac, router_name, hostname, ip, iface, domain, id)"""
@@ -196,7 +241,55 @@ class Store:
                    "router_name=?, hostname=?, last_ip=?, last_iface=?, last_domain=? WHERE id=?", rows)
 
     def delete_device(self, key):
-        self._run("DELETE FROM devices WHERE id=?", (key,))
+        """Forget a device and the other client_ids merged into it. Its usage history stays."""
+        self._tx([("DELETE FROM devices WHERE id=?", (key,)), ("DELETE FROM device_aliases WHERE device=?", (key,))])
+
+    # ---------- merged devices ----------
+    def aliases(self):
+        return {r["cid"]: r for r in self._all("SELECT * FROM device_aliases")}
+
+    def save_alias_counters(self, rows):
+        """rows: (rx, tx, assoc_s, poll_ts, last_seen, mac, router_name, hostname, cid)"""
+        self._many("UPDATE device_aliases SET last_rx=?, last_tx=?, last_assoc_s=?, last_poll=?, last_seen=?, mac=?, "
+                   "router_name=?, hostname=? WHERE cid=?", rows)
+
+    def merge_devices(self, keep, gone, fields):
+        """Make `gone` part of `keep`: its usage history, activity and merged client_ids move over, and its own
+        client_id becomes one of keep's. fields: keep's settings after the merge."""
+        bad = set(fields) - DEVICE_FIELDS - {"first_seen"}
+        if bad:
+            raise ValueError(f"Can't change {', '.join(sorted(bad))}")
+        cols = ", ".join(f"{k}=?" for k in fields)
+        self._tx([
+            ("""INSERT INTO device_minutes SELECT ?, ts, down_bytes, up_bytes, down_mbps_max, up_mbps_max, signal_avg
+                FROM device_minutes WHERE id=? ON CONFLICT(id, ts) DO UPDATE SET
+                down_bytes = down_bytes + excluded.down_bytes, up_bytes = up_bytes + excluded.up_bytes,
+                down_mbps_max = MAX(down_mbps_max, excluded.down_mbps_max), up_mbps_max = MAX(up_mbps_max, excluded.up_mbps_max),
+                signal_avg = COALESCE(signal_avg, excluded.signal_avg)""", (keep, gone)),
+            ("DELETE FROM device_minutes WHERE id=?", (gone,)),
+            ("""INSERT INTO device_days SELECT ?, day, down_bytes, up_bytes FROM device_days WHERE id=?
+                ON CONFLICT(id, day) DO UPDATE SET
+                down_bytes = down_bytes + excluded.down_bytes, up_bytes = up_bytes + excluded.up_bytes""", (keep, gone)),
+            ("DELETE FROM device_days WHERE id=?", (gone,)),
+            ("UPDATE events SET device=? WHERE device=?", (keep, gone)),
+            ("UPDATE device_aliases SET device=? WHERE device=?", (keep, gone)),
+            ("""INSERT OR REPLACE INTO device_aliases
+                SELECT id, ?, mac, router_name, hostname, first_seen, last_seen, last_rx, last_tx, last_assoc_s, last_poll
+                FROM devices WHERE id=?""", (keep, gone)),
+            ("DELETE FROM devices WHERE id=?", (gone,)),
+            (f"UPDATE devices SET {cols} WHERE id=?", (*fields.values(), keep)),
+        ])
+
+    def separate_alias(self, cid, now):
+        """Undo part of a merge: the client_id becomes its own device again, with no history of its own."""
+        self._tx([
+            ("""INSERT OR IGNORE INTO devices (id, mac, first_seen, last_seen, router_name, hostname, acknowledged,
+                    last_rx, last_tx, last_assoc_s, last_poll)
+                SELECT cid, mac, COALESCE(first_seen, ?), last_seen, router_name, hostname, 1,
+                       last_rx, last_tx, last_assoc_s, last_poll
+                FROM device_aliases WHERE cid=?""", (int(now), cid)),
+            ("DELETE FROM device_aliases WHERE cid=?", (cid,)),
+        ])
 
     def add_device_minutes(self, rows):
         """rows: (id, ts, down_bytes, up_bytes, down_mbps_max, up_mbps_max, signal_avg)"""
@@ -237,11 +330,15 @@ class Store:
             used = [p["color"] for p in people]
             color = next((c for c in COLORS if c not in used), COLORS[len(people) % len(COLORS)])
             pid = "p" + format(time.time_ns() & 0xFFFFFFFFFF, "x")
-            self.db.execute("INSERT INTO people VALUES (?,?,?,?)", (pid, name, color, len(people)))
+            self.db.execute("INSERT INTO people (id, name, color, sort) VALUES (?,?,?,?)", (pid, name, color, len(people)))
         return {"id": pid, "name": name, "color": color, "sort": len(people)}
 
-    def rename_person(self, pid, name):
-        self._run("UPDATE people SET name=? WHERE id=?", (name, pid))
+    def update_person(self, pid, **fields):
+        bad = set(fields) - PERSON_FIELDS
+        if bad:
+            raise ValueError(f"Can't change {', '.join(sorted(bad))}")
+        cols = ", ".join(f"{k}=?" for k in fields)
+        self._run(f"UPDATE people SET {cols} WHERE id=?", (*fields.values(), pid))
 
     def delete_person(self, pid):
         with self.lock:

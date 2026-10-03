@@ -198,6 +198,7 @@ struct NewDeviceBanner: View {
     @Environment(OrbitStore.self) private var store
     var devices: [Device]
     var state: OrbitState
+    @State private var merging: (new: Device, known: Device)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -210,15 +211,29 @@ struct NewDeviceBanner: View {
                     Text(d.name).fontWeight(.semibold)
                     Text("· \(d.networkLabel)").foregroundStyle(.secondary)
                     Spacer()
-                    Menu("It’s ours") {
-                        ForEach(state.people) { p in Button(p.name) { store.assign(d.id, to: p.id) } }
+                    if let same = state.device(d.maybeSame) {
+                        Button("Same as \(same.name)?") { merging = (d, same) }
+                            .help("It has the same name as \(same.name), which isn’t connected. It may be the same device with a new address.")
+                    } else {
+                        Menu("It’s ours") {
+                            ForEach(state.people) { p in Button(p.name) { store.assign(d.id, to: p.id) } }
+                        }
+                        .fixedSize()
                     }
-                    .fixedSize()
                     Button("Dismiss") { store.acknowledge(d.id) }
                 }
             }
         }
         .padding(14)
         .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+        .confirmationDialog("Merge \(merging?.new.name ?? "") with \(merging?.known.name ?? "")?",
+                            isPresented: Binding(get: { merging != nil }, set: { if !$0 { merging = nil } })) {
+            Button("Merge") {
+                if let m = merging { Task { _ = await store.merge(m.new.id, with: m.known.id) } }
+                merging = nil
+            }
+        } message: {
+            Text("They become one device, with both histories added together. You can separate them later from its details on the Devices page.")
+        }
     }
 }

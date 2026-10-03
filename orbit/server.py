@@ -28,6 +28,8 @@ CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' 
 MAX_BODY = 16 * 1024
 DEVICE = re.compile(r"/api/devices/([0-9]{1,20})")
 DEVICE_USAGE = re.compile(r"/api/devices/([0-9]{1,20})/usage")
+DEVICE_MERGE = re.compile(r"/api/devices/([0-9]{1,20})/merge")
+DEVICE_ALIAS = re.compile(r"/api/devices/([0-9]{1,20})/aliases/([0-9]{1,20})")
 PERSON = re.compile(r"/api/people/([A-Za-z0-9_-]{1,40})")
 
 
@@ -156,12 +158,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._call(c.start_speedtest)
         if path == "/api/people":
             return self._call(c.add_person, body)
+        if path == "/api/devices/bulk":
+            return self._call(c.bulk_update, body)
+        if path == "/api/devices/forget":
+            return self._call(c.forget_devices, body)
         m = DEVICE.fullmatch(path)
         if m:
             return self._call(c.update_device, m.group(1), body)
+        m = DEVICE_MERGE.fullmatch(path)
+        if m:
+            return self._call(c.merge_devices, m.group(1), body)
         m = PERSON.fullmatch(path)
         if m:
-            return self._call(c.rename_person, m.group(1), body)
+            return self._call(c.update_person, m.group(1), body)
         self._error(404, "Not found")
 
     def _login(self, body):
@@ -183,6 +192,9 @@ class Handler(BaseHTTPRequestHandler):
         m = DEVICE.fullmatch(path)
         if m:
             return self._call(c.forget_device, m.group(1))
+        m = DEVICE_ALIAS.fullmatch(path)
+        if m:
+            return self._call(c.separate_alias, m.group(1), m.group(2))
         m = PERSON.fullmatch(path)
         if m:
             return self._call(c.delete_person, m.group(1))

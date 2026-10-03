@@ -4,6 +4,24 @@ import AppKit
 /// each page, then quit. An app can always picture its own views, so this needs no screen-recording permission.
 enum Snapshot {
     static var folder: String? { ProcessInfo.processInfo.environment["ORBIT_SNAPSHOT_DIR"] }
+    /// ORBIT_SNAPSHOT_DEVICE=<id> (or several, comma-separated) selects devices on the Devices page, to picture the inspector.
+    static var devices: Set<String> {
+        Set((ProcessInfo.processInfo.environment["ORBIT_SNAPSHOT_DEVICE"] ?? "").split(separator: ",").map(String.init))
+    }
+
+    /// Scrolls every scroll view in the window to its end, to picture what's below the fold.
+    @MainActor
+    static func scrollToEnd() {
+        func visit(_ v: NSView) {
+            if let s = v as? NSScrollView, let doc = s.documentView {
+                let end = doc.isFlipped ? max(0, doc.bounds.height - s.contentView.bounds.height) : 0
+                s.contentView.scroll(to: NSPoint(x: 0, y: end))
+                s.reflectScrolledClipView(s.contentView)
+            }
+            v.subviews.forEach(visit)
+        }
+        NSApp.windows.first(where: { $0.isVisible && $0.frame.width > 500 })?.contentView.map(visit)
+    }
 
     @MainActor
     static func window(to path: String) {

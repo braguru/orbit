@@ -20,6 +20,8 @@ final class OrbitStore {
     private var streamTask: Task<Void, Never>?
     private var watchTask: Task<Void, Never>?
     private var lastMessage = Date.distantPast
+    private var lastEventID: Int?          // the newest activity entry seen, so only new ones notify
+    private var askedToNotify = false
     private let decoder: JSONDecoder = {
         let d = JSONDecoder()
         d.keyDecodingStrategy = .convertFromSnakeCase
@@ -77,6 +79,22 @@ final class OrbitStore {
         state = s
         connection = .live
         lastMessage = Date()
+        notify(s)
+    }
+
+    /// A Mac notification when a device or person uses up most or all of their allowance.
+    /// Only for entries that arrive while the app runs: what was there when it connected isn't news.
+    private func notify(_ s: OrbitState) {
+        if !askedToNotify, Snapshot.folder == nil,
+           s.devices.contains(where: { $0.allowance != nil }) || s.people.contains(where: { $0.allowance != nil }) {
+            askedToNotify = true
+            Notifier.prepare()
+        }
+        let newest = s.events.map(\.id).max() ?? 0
+        if let last = lastEventID, askedToNotify {
+            for e in s.events.sorted(by: { $0.id < $1.id }) where e.id > last && e.cat == "usage" { Notifier.post(e) }
+        }
+        lastEventID = max(lastEventID ?? 0, newest)
     }
 
     private func merge(_ list: [Point]) {
@@ -98,11 +116,20 @@ final class OrbitStore {
         return try decoder.decode(T.self, from: data)
     }
 
-    private func post(_ path: String, _ body: [String: Any]) async throws {
+    @discardableResult
+    private func post(_ path: String, _ body: [String: Any]) async throws -> Data {
         var req = URLRequest(url: url(path))
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, response) = try await session.data(for: req)
+        try check(response, data)
+        return data
+    }
+
+    private func delete(_ path: String) async throws {
+        var req = URLRequest(url: url(path))
+        req.httpMethod = "DELETE"
         let (data, response) = try await session.data(for: req)
         try check(response, data)
     }
@@ -124,12 +151,45 @@ final class OrbitStore {
     func assign(_ id: String, to owner: String?) { run { try await self.post("api/devices/\(id)", ["owner": owner ?? NSNull()]) } }
     func setType(_ id: String, to type: String) { run { try await self.post("api/devices/\(id)", ["type": type]) } }
     func acknowledge(_ id: String) { run { try await self.post("api/devices/\(id)", ["acknowledged": true]) } }
+    func setNotes(_ id: String, to notes: String) { run { try await self.post("api/devices/\(id)", ["notes": notes]) } }
+    func setHidden(_ id: String, _ hidden: Bool) { run { try await self.post("api/devices/\(id)", ["hidden": hidden]) } }
+    func separate(_ id: String, cid: String) { run { try await self.delete("api/devices/\(id)/aliases/\(cid)") } }
+    func forget(_ ids: [String]) { run { try await self.post("api/devices/forget", ["ids": ids]) } }
+
+    /// bytes nil removes the allowance. period: "day" or "month".
+    func setAllowance(_ id: String, bytes: Double?, period: String) {
+        run { try await self.post("api/devices/\(id)", ["allowance": Self.allowance(bytes, period)]) }
+    }
+    func setPersonAllowance(_ pid: String, bytes: Double?, period: String) {
+        run { try await self.post("api/people/\(pid)", ["allowance": Self.allowance(bytes, period)]) }
+    }
+    private static func allowance(_ bytes: Double?, _ period: String) -> Any {
+        bytes.map { ["bytes": $0.rounded(), "period": period] as [String: Any] } ?? NSNull()
+    }
+
+    /// The same change to several devices, such as ["owner": "me"] or ["hidden": true].
+    func bulk(_ ids: [String], _ fields: [String: Any]) {
+        let changes: [[String: Any]] = ids.map { id in fields.merging(["id": id]) { _, new in new } }
+        run { try await self.post("api/devices/bulk", ["changes": changes]) }
+    }
+
+    /// Two entries for the same device become one. Returns the id the device keeps.
+    func merge(_ id: String, with other: String) async -> String? {
+        do {
+            let data = try await post("api/devices/\(id)/merge", ["other": other])
+            return (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["id"] as? String
+        } catch {
+            lastError = error.localizedDescription
+            return nil
+        }
+    }
 }
 
 // MARK: - what more than one screen needs
 
 extension OrbitState {
     var connected: [Device] { devices.filter(\.online) }
+    func device(_ id: String?) -> Device? { id.flatMap { id in devices.first { $0.id == id } } }
     var active: [Device] { devices.filter(\.active) }
     var newDevices: [Device] { devices.filter(\.isNew) }
     var me: Person? { people.first { $0.id == "me" } }

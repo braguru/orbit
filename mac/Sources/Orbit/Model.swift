@@ -104,13 +104,41 @@ struct Device: Decodable, Identifiable, Hashable {
     var blocked: Bool?
     var schedules: Int?
     var privateMac: Bool?
+    var typeSet: Bool?
+    var notes: String?
+    var hidden: Bool?
+    var allowance: Allowance?
+    var aliases: [DeviceAlias]?
+    var maybeSame: String?  // for a new device: a known one with the same name, probably it with a new address
 
     var today: Double { todayDown + todayUp }
     var now: Double { downMbps + upMbps }
     var active: Bool { online && now > 0.15 }
+    var isHidden: Bool { hidden == true }
 }
 
-struct Person: Decodable, Identifiable, Hashable { var id: String; var name: String; var color: String }
+/// Another client ID merged into a device: the same phone with a new private address, or on the guest Wi-Fi.
+struct DeviceAlias: Decodable, Identifiable, Hashable {
+    var cid: String
+    var name: String?
+    var mac: String?
+    var lastSeen: Double?
+    var id: String { cid }
+}
+
+/// A data allowance and what's used of it this period. period: "day" or "month". level: 0, 80 or 100.
+struct Allowance: Decodable, Hashable {
+    var bytes: Double
+    var period: String
+    var used: Double
+    var level: Int?
+
+    var fraction: Double { bytes > 0 ? used / bytes : 0 }
+    var per: String { period == "month" ? "a month" : "a day" }
+    var when: String { period == "month" ? "this month" : "today" }
+}
+
+struct Person: Decodable, Identifiable, Hashable { var id: String; var name: String; var color: String; var allowance: Allowance? }
 
 struct Event: Decodable, Identifiable {
     var id: Int

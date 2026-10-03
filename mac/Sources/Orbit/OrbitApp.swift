@@ -107,6 +107,11 @@ struct MainView: View {
                 section = page
                 try? await Task.sleep(for: .seconds(3))
                 Snapshot.window(to: "\(folder)/\(page.rawValue.lowercased()).png")
+                if page == .devices && !Snapshot.devices.isEmpty {  // the rest of the inspector, too
+                    Snapshot.scrollToEnd()
+                    try? await Task.sleep(for: .seconds(1))
+                    Snapshot.window(to: "\(folder)/devices-end.png")
+                }
             }
             NSApp.terminate(nil)
         }

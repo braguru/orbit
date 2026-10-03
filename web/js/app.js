@@ -1,13 +1,13 @@
 /* Orbit: the app shell. Navigation, search, toasts and changes all go through here. */
 import {
-  html, useState, useEffect, useRef, useMemo, useCallback, Fragment, uid, clamp, IS_MAC, fmtShortDate, fmtDur,
-  Icon, BrandMark, Glyph, Modal, statusOf, personOf,
+  html, useState, useEffect, useRef, useMemo, useCallback, Fragment, uid, clamp, IS_MAC, fmtShortDate, fmtDur, fmtLimit,
+  Icon, BrandMark, Glyph, Modal, statusOf, personOf, PERIOD,
 } from './lib.js';
 import { useLive, send } from './data.js';
 import { Overview, derive } from './overview.js';
 import { SpeedModal } from './speedtest.js';
-import { DevicesView, DeviceDrawer } from './devices.js';
-import { PeopleView, PersonModal } from './people.js';
+import { DevicesView, DeviceDrawer, MergeModal } from './devices.js';
+import { PeopleView, PersonModal, AllowanceModal } from './people.js';
 import { UsageView } from './usage.js';
 import { StarlinkView } from './starlink.js';
 import { ActivityView } from './activity.js';
@@ -65,6 +65,72 @@ function makeApi(getS, refresh, ui) {
       const d = dev(id);
       ui.closeDevice();
       send('DELETE', `/api/devices/${id}`).then(() => { refresh(); ui.toast({ icon: 'trash-2', text: `Forgot ${d ? d.name : 'the device'}`, sub: 'If it connects again, it shows up as new.' }); }, fail);
+    },
+    setNotes(id, notes) {
+      post(`/api/devices/${id}`, { notes }).then(() => ui.toast({ icon: 'pencil', text: notes ? 'Note saved' : 'Note removed', ttl: 2500 }), fail);
+    },
+    setHidden(id, hidden) {
+      const d = dev(id);
+      if (!d) return;
+      post(`/api/devices/${id}`, { hidden }).then(() => ui.toast({
+        icon: hidden ? 'eye-off' : 'eye', text: hidden ? `Hid ${d.name}` : `${d.name} is back in your lists`,
+        sub: hidden ? 'It’s under Hidden on the Devices page. Orbit still records what it uses.' : null,
+        undo: () => post(`/api/devices/${id}`, { hidden: !hidden }).catch(fail),
+      }), fail);
+    },
+    setAllowance(id, allowance) {
+      const d = dev(id);
+      if (!d) return;
+      const prev = d.allowance ? { bytes: d.allowance.bytes, period: d.allowance.period } : null;
+      post(`/api/devices/${id}`, { allowance }).then(() => ui.toast({
+        icon: 'bell-ring', text: allowance ? `${d.name}: ${fmtLimit(allowance.bytes)} ${PERIOD[allowance.period].per}` : `Removed ${d.name}’s allowance`,
+        sub: allowance ? 'Orbit tells you when it’s nearly used up, and when it’s used up.' : null,
+        undo: () => post(`/api/devices/${id}`, { allowance: prev }).catch(fail),
+      }), fail);
+    },
+    setPersonAllowance(pid, allowance) {
+      const p = personOf(getS().people, pid);
+      if (!p) return;
+      const prev = p.allowance ? { bytes: p.allowance.bytes, period: p.allowance.period } : null;
+      post(`/api/people/${pid}`, { allowance }).then(() => ui.toast({
+        icon: 'bell-ring', text: allowance ? `${p.name}: ${fmtLimit(allowance.bytes)} ${PERIOD[allowance.period].per}` : `Removed ${p.name}’s allowance`,
+        sub: allowance ? `It counts all of ${p.name}’s devices together.` : null,
+        undo: () => post(`/api/people/${pid}`, { allowance: prev }).catch(fail),
+      }), fail);
+    },
+    /* One change to several devices: changes is [{id, owner | type | hidden | acknowledged}]. */
+    bulk(changes, text, icon = 'tag') {
+      const before = changes.map(c => {
+        const d = dev(c.id) || {};
+        const b = { id: c.id };
+        if ('owner' in c) b.owner = d.owner || null;
+        if ('type' in c) b.type = d.type_set ? d.type : null;
+        if ('hidden' in c) b.hidden = !!d.hidden;
+        return b;
+      }).filter(b => Object.keys(b).length > 1);
+      return post('/api/devices/bulk', { changes }).then(() => ui.toast({
+        icon, text, undo: before.length ? () => post('/api/devices/bulk', { changes: before }).catch(fail) : null,
+      }), fail);
+    },
+    forgetMany(ids) {
+      const names = ids.map(id => (dev(id) || {}).name).filter(Boolean);
+      ui.closeDevice();
+      return post('/api/devices/forget', { ids }).then(() => ui.toast({
+        icon: 'trash-2', text: ids.length === 1 ? `Forgot ${names[0] || 'the device'}` : `Forgot ${ids.length} devices`,
+        sub: ids.length === 1 ? 'If it connects again, it shows up as new.' : 'If they connect again, they show up as new.',
+      }), fail);
+    },
+    merge(id, other) {
+      post(`/api/devices/${id}/merge`, { other }).then(r => {
+        ui.openDevice(r.id);
+        ui.toast({ icon: 'link', text: `Merged into ${r.name}`, sub: 'One device now, with both histories.' });
+      }, fail);
+    },
+    separate(id, cid, name) {
+      send('DELETE', `/api/devices/${id}/aliases/${cid}`).then(() => {
+        refresh();
+        ui.toast({ icon: 'unlink', text: `${name || 'That connection'} is its own device again`, sub: 'What it used so far stays where it was.' });
+      }, fail);
     },
     addPerson(name, devices) {
       post('/api/people', { name, devices }).then(() => { ui.toast({ icon: 'user-plus', text: `Added ${name}`, sub: devices.length ? `${devices.length} device${devices.length === 1 ? '' : 's'} moved to ${name}.` : 'Open a device and choose them as its owner.' }); ui.go('people'); }, fail);
@@ -144,7 +210,7 @@ function Palette({ s, api, ui, theme, toggleTheme, session }) {
   add('Actions', 'Add a person', 'user-plus', () => ui.openModal({ type: 'person' }));
   add('Actions', theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme', theme === 'dark' ? 'sun' : 'moon', toggleTheme);
   if (session && session.required && !session.local) add('Actions', 'Sign out of this device', 'unlink', () => api.signOut());
-  s.devices.forEach(d => add('Devices', d.name, null, () => ui.openDevice(d.id), { device: d, hint: statusOf(d).label + (d.ip ? ' · ' + d.ip : '') }));
+  s.devices.forEach(d => add('Devices', d.name, null, () => ui.openDevice(d.id), { device: d, hint: statusOf(d).label + (d.hidden ? ' · Hidden' : '') + (d.ip ? ' · ' + d.ip : '') }));
   s.people.forEach(p => add('People', p.name, 'user', () => ui.go('people')));
   const words = q.trim().toLowerCase().split(/\s+/).filter(Boolean);
   const shown = items.filter(it => words.every(w => (it.label + ' ' + (it.hint || '') + ' ' + it.group).toLowerCase().includes(w)));
@@ -219,6 +285,7 @@ function App() {
       seen.current.add(e.id);
       if (e.cat === 'security' && e.device) toast({ icon: 'shield-alert', text: e.title, sub: e.detail, ttl: 15000, actions: [{ label: 'Review', fn: () => ui.openDevice(e.device) }] });
       else if (e.icon === 'gauge' && e.cat === 'network') toast({ icon: 'gauge', text: e.title, sub: e.detail, ttl: 9000, actions: [{ label: 'Details', fn: () => ui.openModal({ type: 'speed' }) }] });
+      else if (e.cat === 'usage') toast({ icon: 'bell-ring', text: e.title, sub: e.detail, ttl: 15000, actions: [e.device ? { label: 'Details', fn: () => ui.openDevice(e.device) } : { label: 'People', fn: () => ui.go('people') }] });
     }
   }, [s && s.events[0] && s.events[0].id]);
 
@@ -253,6 +320,8 @@ function App() {
     else if (modal.type === 'confirm') modalEl = html`<${ConfirmModal} m=${modal} ui=${ui} />`;
     else if (modal.type === 'palette') modalEl = html`<${Palette} s=${s} api=${api} ui=${ui} theme=${theme} toggleTheme=${toggleTheme} session=${session} />`;
     else if (modal.type === 'speed') modalEl = html`<${SpeedModal} s=${s} api=${api} ui=${ui} />`;
+    else if (modal.type === 'merge') modalEl = html`<${MergeModal} s=${s} api=${api} ui=${ui} id=${modal.id} other=${modal.other} />`;
+    else if (modal.type === 'allowance') modalEl = html`<${AllowanceModal} s=${s} api=${api} ui=${ui} person=${modal.person} />`;
   }
   const d = s.dish;
   const netPill = d.reachable === false ? html`<span className="net-pill"><${Icon} name="satellite-dish" size=${14} />Can’t reach dish</span>`

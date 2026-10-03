@@ -1,9 +1,9 @@
 /* Overview: the health headline, the live orbit map, who's using the internet, and today at a glance. */
 import {
   html, useState, useMemo, useRef, Fragment, clamp, sum, enterKey, DAY, MIN, readPref, writePref,
-  fmtMbps, fmtBytes, fmtDur, fmtAgo, fmtSecs, fmtClock, plural, Icon, Glyph, Spark, Stat, AssignMenu, LineChart, HBars,
+  fmtMbps, fmtBytes, fmtDur, fmtAgo, fmtSecs, fmtClock, fmtLimit, plural, Icon, Glyph, Spark, Stat, AssignMenu, LineChart, HBars,
   OutageStrip, useSize, personOf, pcol, devColor, devSky, ownerLabel, signalInfo, bandLabel, netLabel,
-  statusOf, isWired, isActive, typeIcon,
+  statusOf, isWired, isActive, typeIcon, PERIOD,
 } from './lib.js';
 import { ICONS } from './icons.js';
 
@@ -75,6 +75,7 @@ function Hero({ s, x, points, api, ui }) {
 
 function Attention({ list, s, api, ui }) {
   const weak = list.some(d => d.signal != null && d.signal < -72);
+  const same = d => d.maybe_same && s.devices.find(z => z.id === d.maybe_same);
   return html`<div className="banner warn" role="status">
     <span className="banner-ic"><${Icon} name="shield-alert" size=${18} /></span>
     <div className="grow" style=${{ minWidth: 0 }}>
@@ -87,7 +88,8 @@ function Attention({ list, s, api, ui }) {
           <div className="urow-meta">${netLabel(d)} · ${bandLabel(d)} · joined ${fmtAgo(d.first_seen, s.now)}</div>
         </div>
         <div className="row">
-          <${AssignMenu} people=${s.people} onPick=${pid => api.assign(d.id, pid)} label="It’s ours" align="right" />
+          ${same(d) ? html`<button type="button" className="btn btn-sm btn-primary" onClick=${() => ui.openModal({ type: 'merge', id: d.id, other: d.maybe_same })}><${Icon} name="link" size=${14} />Same as ${same(d).name}?</button>`
+            : html`<${AssignMenu} people=${s.people} onPick=${pid => api.assign(d.id, pid)} label="It’s ours" align="right" />`}
           <button type="button" className="btn btn-sm" onClick=${() => api.acknowledge(d.id)}>Dismiss</button>
         </div>
       </div>`)}
@@ -115,7 +117,8 @@ function OrbitMap({ s, ui }) {
     const r = () => { a = (a * 16807) % 2147483647; return a / 2147483647; };
     return Array.from({ length: 90 }, (_, i) => ({ x: r() * 600, y: r() * 600, r: 0.4 + r() * 1.1, o: 0.15 + r() * 0.55, tw: i % 6 === 0, delay: (r() * 4).toFixed(2) }));
   }, []);
-  const vis = s.devices.filter(d => d.online);
+  const vis = s.devices.filter(d => d.online && !d.hidden);
+  const hiddenN = s.devices.filter(d => d.online && d.hidden).length;
   const order = [...s.people.map(p => p.id), null];
   const groups = order.map(pid => vis.filter(d => (d.owner || null) === pid).sort((a, b) => sigVal(b) - sigVal(a))).filter(g => g.length);
   const GAP = 9;
@@ -139,7 +142,7 @@ function OrbitMap({ s, ui }) {
   const nodeR = d => 12 + 10 * Math.sqrt(Math.min(1, d.down_mbps / 45));
   return html`<section className="sky orbit" aria-label="Map of connected devices">
     <div className="orbit-head">
-      <div><h2 className="sky-title">Your network right now</h2><div className="sky-sub">${plural(vis.length, 'device')} connected · ${activeN} using the internet</div></div>
+      <div><h2 className="sky-title">Your network right now</h2><div className="sky-sub">${plural(vis.length, 'device')} connected · ${activeN} using the internet${hiddenN ? ` · ${hiddenN} hidden` : ''}</div></div>
       <span className="live-pill"><span className="live-dot" />Live</span>
     </div>
     <div className=${'orbit-stage' + (tip ? ' is-held' : '')} ref=${stageRef}>
@@ -298,8 +301,27 @@ function DataToday({ s, ui }) {
 }
 
 /* ---------- suggestions ---------- */
-function buildInsights(s, x) {
+/* Devices and people that have used most of their data allowance. */
+function allowanceInsights(s) {
   const out = [];
+  const add = (kind, ref, name, a) => {
+    if (!a || a.level < 80) return;
+    const device = kind === 'device';
+    const per = PERIOD[a.period];
+    const key = a.period === 'day' ? s.home.day : s.home.day.slice(0, 7);
+    out.push({
+      id: `allow-${kind}-${ref}-${a.level}-${key}`, icon: 'bell-ring', tone: 'warn',
+      title: a.level >= 100 ? `${name} has used ${device ? 'its' : 'their'} ${per.adj} allowance` : `${name} has used most of ${device ? 'its' : 'their'} ${per.adj} allowance`,
+      body: `${fmtBytes(a.used)} of ${fmtLimit(a.bytes)} ${per.when}. Orbit can’t cut ${device ? 'it' : 'them'} off. To pause ${device ? 'it' : 'their devices'}, use the Starlink app.`,
+      acts: [device ? { label: 'Details', fn: (api, ui) => ui.openDevice(ref) } : { label: 'Go to People', fn: (api, ui) => ui.go('people') }],
+    });
+  };
+  s.devices.forEach(d => add('device', d.id, d.name, d.allowance));
+  s.people.forEach(p => add('person', p.id, p.name, p.allowance));
+  return out;
+}
+function buildInsights(s, x) {
+  const out = allowanceInsights(s);
   const conn = x.conn;
   const weak = conn.filter(d => d.signal != null && d.signal < -72).sort((a, b) => a.signal - b.signal)[0];
   if (weak) out.push({
@@ -336,13 +358,13 @@ function buildInsights(s, x) {
     id: 'big-' + big.id + '-' + s.home.day, icon: 'arrow-down', title: `${big.name} has downloaded ${fmtBytes(big.today_down)} today`,
     body: 'That’s the most of any device today. Big app, game or system updates are the usual reason.', acts: [{ label: 'Details', fn: (api, ui) => ui.openDevice(big.id) }],
   });
-  const unnamed = s.devices.filter(d => !d.custom_name && !d.router_name && !d.hostname);
+  const unnamed = s.devices.filter(d => !d.custom_name && !d.router_name && !d.hostname && !d.hidden);
   if (unnamed.length) out.push({
     id: 'unnamed', icon: 'tag', title: `${plural(unnamed.length, 'device has', 'devices have')} no name`,
     body: 'Give each one a name, so you can tell what it is at a glance. Usage helps: the busiest unnamed device is often a TV or computer.',
     acts: [{ label: 'Name it', primary: true, fn: (api, ui) => ui.openDevice(unnamed.sort((a, b) => b.today_down - a.today_down)[0].id) }],
   });
-  const unowned = s.devices.filter(d => !d.owner && !d.is_new);
+  const unowned = s.devices.filter(d => !d.owner && !d.is_new && !d.hidden);
   if (unowned.length >= 2) out.push({
     id: 'owners', icon: 'users-round', title: `Tell Orbit whose devices these are`,
     body: `${plural(unowned.length, 'device has', 'devices have')} no owner yet. Once each one has an owner, you can see who uses the most data.`,
@@ -352,6 +374,16 @@ function buildInsights(s, x) {
     id: 'speedtest', icon: 'gauge', title: 'Find out your real speed',
     body: 'Orbit compares what your home uses with your last speed test. Run one to set the baseline. It takes about 30 seconds.',
     acts: [{ label: 'Run a speed test', primary: true, fn: (api, ui) => ui.openModal({ type: 'speed' }) }],
+  });
+  const old = s.devices.filter(d => !d.online && !d.hidden && d.last_seen && s.now - d.last_seen > 30 * DAY);
+  if (old.length) out.push({
+    id: 'stale-' + old.map(d => d.id).join('-'), icon: 'history',
+    title: `${plural(old.length, 'device hasn’t', 'devices haven’t')} connected for a month`,
+    body: `${old.slice(0, 3).map(d => d.name).join(', ')}${old.length > 3 ? ` and ${old.length - 3} more` : ''}. Forgetting old devices keeps your list short, so a stranger stands out right away.`,
+    acts: [{ label: old.length === 1 ? 'Forget it' : 'Forget them', fn: (api, ui) => ui.openModal({
+      type: 'confirm', title: old.length === 1 ? `Forget ${old[0].name}?` : `Forget ${old.length} old devices?`, label: 'Forget', danger: true,
+      body: 'If they connect again, they show up as new devices. Usage history stays in your totals.', fn: () => api.forgetMany(old.map(d => d.id)),
+    }) }],
   });
   const blocked = s.devices.filter(d => d.blocked);
   if (blocked.length) out.push({

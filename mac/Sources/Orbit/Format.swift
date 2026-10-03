@@ -17,6 +17,9 @@ enum Format {
         return String(format: "%.2f TB", gb / 1000)
     }
 
+    /// An amount you chose, like an allowance: "2 GB" rather than "2.0 GB".
+    static func limit(_ b: Double) -> String { bytes(b).replacingOccurrences(of: ".0 ", with: " ") }
+
     static func duration(ms: Double) -> String {
         let m = Int((ms / 60_000).rounded())
         if m < 1 { return "under a minute" }
@@ -122,6 +125,12 @@ enum Icons {
         case "ban": return "nosign"
         case "play": return "play.circle"
         case "triangle-alert": return "exclamationmark.triangle"
+        case "bell-ring": return "bell.badge"
+        case "eye-off": return "eye.slash"
+        case "eye": return "eye"
+        case "link": return "arrow.triangle.merge"
+        case "unlink": return "arrow.triangle.branch"
+        case "shield-check": return "checkmark.shield"
         default: return "circle"
         }
     }

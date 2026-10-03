@@ -29,6 +29,10 @@ ID_RE = re.compile(r"^[0-9]{1,20}$")
 IFACE_BAND = {"RF_2GHZ": "2.4", "RF_5GHZ": "5", "RF_5GHZ_HIGH": "5", "RF_6GHZ": "6", "ETH": "eth"}
 TYPES = {"phone", "laptop", "desktop", "tablet", "watch", "tv", "console", "speaker", "camera", "thermostat",
          "lights", "vacuum", "plug", "ereader", "printer", "unknown"}
+# Data allowances: Orbit warns when a device or person has used 80% and 100% of theirs. It can't cut anyone off.
+PERIODS = {"day": ("a day", "daily", "today"), "month": ("a month", "monthly", "this month")}
+ALLOWANCE_LEVELS = (100, 80)
+MIN_ALLOWANCE, MAX_ALLOWANCE = 1e6, 1e14  # 1 MB to 100 TB
 
 OUTAGE_TEXT = {
     "BOOTING": "Starlink was starting up",
@@ -151,6 +155,42 @@ def clean_text(v, limit):
     return re.sub(r"\s+", " ", s).strip()[:limit]
 
 
+def clean_note(v, limit=500):
+    """Like clean_text, but keeps line breaks (at most one blank line in a row)."""
+    lines = [clean_text(line, limit) for line in str(v or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()[:limit]
+
+
+def fmt_bytes(b):
+    """Data amounts, written like the web page does."""
+    mb = (b or 0) / 1e6
+    if mb <= 0:
+        return "0 MB"
+    if mb < 1:
+        return "<1 MB"
+    if mb < 1000:
+        return f"{round(mb)} MB"
+    gb = mb / 1000
+    if gb < 1000:
+        return f"{gb:.1f} GB" if gb < 100 else f"{round(gb)} GB"
+    return f"{gb / 1000:.2f} TB"
+
+
+def fmt_limit(b):
+    """An allowance you chose, like "2 GB" rather than "2.0 GB"."""
+    return re.sub(r"\.0+ ", " ", fmt_bytes(b))
+
+
+def period_key(period, ts):
+    """Which allowance period ts falls in: the local day, or the month."""
+    day = local_day(ts)
+    return day if period == "day" else day[:7]
+
+
+def allowance_level(used, limit):
+    return next((lv for lv in ALLOWANCE_LEVELS if limit and used >= limit * lv / 100), 0)
+
+
 def private_mac(mac):
     """Phones make up a random MAC address per network for privacy; those have this bit set."""
     try:
@@ -206,11 +246,17 @@ class Collector:
         self.speedtest = {"running": False}
         self.tests = [self._test_out(r) for r in store.speedtests(10)]
         self.fake_speedtest = os.environ.get("ORBIT_FAKE_SPEEDTEST") == "1"  # development: simulate, use no data
-        self.devices = {}   # client_id -> device dict (saved fields plus live ones)
+        self.devices = {}   # device id (its first client_id) -> device dict (saved fields plus live ones)
+        self.aliases = {}   # client_id -> device id, for the other client_ids of a device you merged
+        self.alias_rows = {}  # client_id -> that connection's saved details: names, and counters when Orbit last saw it
         self.counters = {}  # client_id -> (rx_bytes, tx_bytes, associated_s, poll_ts)
         self.recent = {}    # client_id -> deque of (poll_ts, down_bytes, up_bytes) for the live speed
-        self.acc = {}       # client_id -> [down, up, max_down_mbps, max_up_mbps, signal_sum, signal_n] this minute
+        self.acc = {}       # device id -> [down, up, max_down_mbps, max_up_mbps, signal_sum, signal_n] this minute
         self.acc_minute = None
+        # Held while a minute of device usage is written, so a merge never leaves some of it on the old entry.
+        self.flush_lock = threading.Lock()
+        self._month_cache = (None, {})  # ((day, 5-minute slot), {device id: bytes this month before today})
+        self._allowances_checked = 0.0
         init = store.meta("initialized")
         self.initialized = init is not None
         self.watching_since = int(init) if init else None
@@ -232,6 +278,10 @@ class Collector:
             d.update(online=False, ip=row.get("last_ip"), iface=row.get("last_iface"), domain=row.get("last_domain"),
                      type_guess=guess_type(row.get("router_name"), row.get("hostname")))
             self.devices[key] = d
+        for cid, row in self.store.aliases().items():
+            if row["device"] in self.devices:
+                self.aliases[cid] = row["device"]
+                self.alias_rows[cid] = dict(row)
         self.home_today = list(self.store.home_bytes(day_start(now), now))
         self.dev_today = {m: list(v) for m, v in self.store.device_day_totals(self.day).items()}
         for e in reversed(self.store.events(40)):
@@ -408,6 +458,12 @@ class Collector:
                 self._on_clients(self.router.read("wifi_get_clients").get("clients") or [], t)
             except Exception:
                 self._on_router_error()
+            if t - self._allowances_checked >= 10:
+                self._allowances_checked = t
+                try:
+                    self._check_allowances(t)
+                except Exception:
+                    traceback.print_exc()
             self.stopping.wait(max(0.2, 2 - (time.time() - t)))
 
     def _on_clients(self, clients, t):
@@ -421,12 +477,17 @@ class Collector:
         with self.lock:
             back = self.router_live.get("reachable") is False
             self.router_live.update(reachable=True, fails=0, updated=t)
+            # A merged device can have more than one client_id. Its own comes first, so its live details win
+            # if both are connected at once (a laptop on Wi-Fi and a cable).
+            clients = sorted(clients, key=lambda c: str(c.get("client_id") or "") in self.aliases)
             for c in clients:
                 if c.get("role") == "CONTROLLER":  # the router itself
                     continue
-                key = str(c.get("client_id") or "")
-                if not ID_RE.match(key) or key == "0":
+                cid = str(c.get("client_id") or "")
+                if not ID_RE.match(cid) or cid == "0":
                     continue
+                key = self.aliases.get(cid, cid)
+                again = key in seen  # a second connection of a device already counted in this poll
                 seen.add(key)
                 mac = str(c.get("mac_address") or "").upper()
                 given, host = clean_text(c.get("given_name"), 60), clean_text(c.get("name"), 60)
@@ -439,22 +500,29 @@ class Collector:
                 wired = iface == "ETH"
                 rx, tx = num(g(c, "rx_stats.bytes")) or 0.0, num(g(c, "tx_stats.bytes")) or 0.0
                 assoc = num(c.get("associated_time_s")) or 0.0
-                prev = self.counters.get(key)
-                down, up = self._deltas(key, d, rx, tx, assoc, t)
+                prev = self.counters.get(cid)
+                down, up = self._deltas(cid, d if cid == key else self.alias_rows.get(cid) or {}, rx, tx, assoc, t)
                 # A normal poll, not the first one after Orbit restarted or the device reconnected
                 steady = prev is not None and rx >= prev[0] and tx >= prev[1] and assoc + 5 >= prev[2]
-                down_mbps, up_mbps = self._speed(key, down if steady else 0.0, up if steady else 0.0, t, fresh=not steady)
+                down_mbps, up_mbps = self._speed(cid, down if steady else 0.0, up if steady else 0.0, t, fresh=not steady)
                 signal = None if wired else num(c.get("signal_strength"))
                 a = self.acc.setdefault(key, [0.0, 0.0, 0.0, 0.0, 0.0, 0])
                 a[0] += down
                 a[1] += up
                 a[2], a[3] = max(a[2], down_mbps), max(a[3], up_mbps)
-                if signal is not None:
+                if signal is not None and not again:
                     a[4] += signal
                     a[5] += 1
                 today = self.dev_today.setdefault(key, [0.0, 0.0])
                 today[0] += down
                 today[1] += up
+                if cid != key:  # what the merged connection calls itself now, for its details and for saving
+                    r = self.alias_rows.setdefault(cid, {"cid": cid, "device": key})
+                    r.update(mac=mac or r.get("mac"), router_name=given or None, hostname=host or None, last_seen=int(t))
+                if again:  # its live speed adds up; the other details stay those of the first connection
+                    d["down_mbps"] = (d.get("down_mbps") or 0.0) + down_mbps
+                    d["up_mbps"] = (d.get("up_mbps") or 0.0) + up_mbps
+                    continue
                 was_online, offline_since = d.get("online"), d.get("offline_since")
                 blocked = bool(c.get("blocked"))  # set from the Starlink app: paused, or inside a block schedule
                 if was_online and blocked != bool(d.get("blocked")):
@@ -483,13 +551,21 @@ class Collector:
             self.event("network", "radar", "Orbit started watching your network",
                        f"Found {len(seen)} device{'' if len(seen) == 1 else 's'} on your Wi-Fi.")
         for d in joined:
+            with self.lock:
+                same = self.devices.get(self._same_as(d, seen) or "")
+            hint = f". It may be {display_name(same)} with a new address." if same else ""
             self.event("security", "shield-alert", "A new device joined your Wi-Fi",
-                       f"{display_name(d)} · {self._net_label(d)}", device=d["id"], tone="warn")
+                       f"{display_name(d)} · {self._net_label(d)}{hint}", device=d["id"], tone="warn")
+        # Hidden devices still count, but their comings and goings stay out of the activity feed.
         for d in came:
-            self.event("devices", "wifi", f"{display_name(d)} connected", self._net_label(d), device=d["id"])
+            if not d.get("hidden"):
+                self.event("devices", "wifi", f"{display_name(d)} connected", self._net_label(d), device=d["id"])
         for d in went:
-            self.event("devices", "wifi-off", f"{display_name(d)} disconnected", device=d["id"])
+            if not d.get("hidden"):
+                self.event("devices", "wifi-off", f"{display_name(d)} disconnected", device=d["id"])
         for d, blocked in flipped:
+            if d.get("hidden"):
+                continue
             if blocked:
                 self.event("devices", "ban", f"{display_name(d)} lost internet access", "Blocked from the Starlink app.", device=d["id"])
             else:
@@ -529,15 +605,16 @@ class Collector:
         moved_up = sum(x[2] for x in list(q)[1:]) if len(q) > 1 else up
         return moved_down * 8 / 1e6 / span, moved_up * 8 / 1e6 / span
 
-    def _deltas(self, key, d, rx, tx, assoc, t):
-        """Bytes downloaded and uploaded since the last poll. The router's counters restart when a device reconnects."""
-        prev = self.counters.get(key)
-        self.counters[key] = (rx, tx, assoc, t)
+    def _deltas(self, cid, saved, rx, tx, assoc, t):
+        """Bytes downloaded and uploaded since the last poll. The router's counters restart when a device reconnects.
+        saved: the counters Orbit saved for this client_id, for the first poll after Orbit starts."""
+        prev = self.counters.get(cid)
+        self.counters[cid] = (rx, tx, assoc, t)
         if prev is None:
-            last_poll, last_rx, last_tx = d.get("last_poll"), d.get("last_rx"), d.get("last_tx")
+            last_poll, last_rx, last_tx = saved.get("last_poll"), saved.get("last_rx"), saved.get("last_tx")
             if last_poll and last_rx is not None and last_tx is not None:
                 gap = t - last_poll
-                if assoc >= (d.get("last_assoc_s") or 0) + gap - 60 and rx >= last_rx and tx >= last_tx:
+                if assoc >= (saved.get("last_assoc_s") or 0) + gap - 60 and rx >= last_rx and tx >= last_tx:
                     return self._sane(rx - last_rx, tx - last_tx, gap)  # stayed connected while Orbit was off
                 if assoc < gap:
                     return self._sane(rx, tx, assoc)  # reconnected while Orbit was off
@@ -554,23 +631,30 @@ class Collector:
         return (down if 0 <= down <= cap else 0.0), (up if 0 <= up <= cap else 0.0)
 
     def _flush_devices(self):
-        with self.lock:
-            minute, acc, self.acc = self.acc_minute, self.acc, {}
-            if minute is None:
-                return
-            day = local_day(minute)
-            minutes = [(key, minute, a[0], a[1], a[2], a[3], (a[4] / a[5]) if a[5] else None)
-                       for key, a in acc.items() if a[0] or a[1] or a[5]]
-            days = [(key, day, a[0], a[1]) for key, a in acc.items() if a[0] or a[1]]
-            counters = []
-            for key, (rx, tx, assoc, pt) in self.counters.items():
-                d = self.devices.get(key)
-                if d:
-                    counters.append((rx, tx, assoc, pt, int(d.get("last_seen") or pt), d.get("mac"), d.get("router_name"),
-                                     d.get("hostname"), d.get("ip"), d.get("iface"), d.get("domain"), key))
-        self.store.add_device_minutes(minutes)
-        self.store.add_device_days(days)
-        self.store.save_counters(counters)
+        with self.flush_lock:
+            with self.lock:
+                minute, acc, self.acc = self.acc_minute, self.acc, {}
+                if minute is None:
+                    return
+                day = local_day(minute)
+                minutes = [(key, minute, a[0], a[1], a[2], a[3], (a[4] / a[5]) if a[5] else None)
+                           for key, a in acc.items() if a[0] or a[1] or a[5]]
+                days = [(key, day, a[0], a[1]) for key, a in acc.items() if a[0] or a[1]]
+                counters, alias_counters = [], []
+                for cid, (rx, tx, assoc, pt) in self.counters.items():
+                    r = self.alias_rows.get(cid) if cid in self.aliases else None
+                    if r is not None:
+                        alias_counters.append((rx, tx, assoc, pt, int(r.get("last_seen") or pt), r.get("mac"),
+                                               r.get("router_name"), r.get("hostname"), cid))
+                        continue
+                    d = self.devices.get(cid)
+                    if d:
+                        counters.append((rx, tx, assoc, pt, int(d.get("last_seen") or pt), d.get("mac"), d.get("router_name"),
+                                         d.get("hostname"), d.get("ip"), d.get("iface"), d.get("domain"), cid))
+            self.store.add_device_minutes(minutes)
+            self.store.add_device_days(days)
+            self.store.save_counters(counters)
+            self.store.save_alias_counters(alias_counters)
 
     def _net_label(self, d):
         net = self.networks.get(d.get("domain") or "")
@@ -829,19 +913,145 @@ class Collector:
         return rows
 
     def _people(self):
+        """People as saved: id, name, color, and their allowance."""
         if self._people_cache is None:
-            self._people_cache = [{"id": p["id"], "name": p["name"], "color": p["color"]} for p in self.store.people()]
+            self._people_cache = self.store.people()
         return self._people_cache
 
     def _invalidate(self):
         self._people_cache = None
         self._state_cache = (0.0, b"")
 
-    def _device_out(self, d):
+    # ---------- allowances ----------
+    def _month_saved(self, now):
+        """Per device, the data it used this month before today, from the saved daily totals."""
+        day = local_day(now)
+        slot = (day, int(now // 300))  # refreshed every 5 minutes, so yesterday's last minute is in by then
+        with self.lock:
+            at, saved = self._month_cache
+        if at == slot:
+            return saved
+        first, last = day[:8] + "01", (date.fromisoformat(day) - timedelta(days=1)).isoformat()
+        rows = self.store.device_usage_days(first, last) if last >= first else {}
+        saved = {k: v[0] + v[1] for k, v in rows.items()}
+        with self.lock:
+            self._month_cache = (slot, saved)
+        return saved
+
+    def _used(self, keys, period, month):
+        """Data the devices in keys used this period, down and up together. Call with the lock held."""
+        total = sum(sum(self.dev_today.get(k) or (0.0, 0.0)) for k in keys)
+        if period == "month":
+            total += sum(month.get(k, 0.0) for k in keys)
+        return total
+
+    def _used_now(self, keys, period, now):
+        month = self._month_saved(now) if period == "month" else {}
+        with self.lock:
+            return self._used(keys, period, month)
+
+    def _allowance_out(self, row, keys, month):
+        """A device's or person's allowance with what they've used so far, or None. Call with the lock held."""
+        limit = row.get("allowance_bytes")
+        if not limit:
+            return None
+        period = row.get("allowance_period") or "day"
+        used = self._used(keys, period, month)
+        return {"bytes": limit, "period": period, "used": used, "level": allowance_level(used, limit)}
+
+    def _owned(self, pid):
+        return [k for k, d in self.devices.items() if d.get("owner") == pid]
+
+    @staticmethod
+    def _allowance_fields(value, used_of, now):
+        """{"bytes": 2e9, "period": "day"} sets an allowance; None removes it. used_of(period) is what's used so far:
+        that much doesn't alert, because you see it as you set the allowance."""
+        if value is None:
+            return {"allowance_bytes": None, "allowance_period": None, "allowance_alerted": None}
+        if not isinstance(value, dict) or value.get("period") not in PERIODS:
+            raise ValueError("An allowance needs an amount, and a period: a day or a month")
+        b = value.get("bytes")
+        if isinstance(b, bool) or not isinstance(b, (int, float)) or not math.isfinite(b) or not MIN_ALLOWANCE <= b <= MAX_ALLOWANCE:
+            raise ValueError("Choose an allowance between 1 MB and 100 TB")
+        period = value["period"]
+        return {"allowance_bytes": float(b), "allowance_period": period,
+                "allowance_alerted": f"{period_key(period, now)}|{allowance_level(used_of(period), b)}"}
+
+    def _check_allowances(self, now):
+        """Report each device and person that has used 80%, and then all, of their allowance. Once per period."""
+        month = self._month_saved(now)
+        people = self._people()
+        found = []
+        with self.lock:
+            for key, d in self.devices.items():
+                a = self._allowance_out(d, [key], month)
+                if a:
+                    found.append(("device", key, display_name(d), d, a))
+            for p in people:
+                a = self._allowance_out(p, self._owned(p["id"]), month)
+                if a:
+                    found.append(("person", p["id"], p["name"], p, a))
+        for kind, ref, name, row, a in found:
+            pk = period_key(a["period"], now)
+            done_key, _, done = (row.get("allowance_alerted") or "").partition("|")
+            if a["level"] <= (int(done) if done_key == pk and done.isdigit() else 0):
+                continue
+            mark = f"{pk}|{a['level']}"
+            with self.lock:
+                if (row.get("allowance_bytes"), row.get("allowance_period")) != (a["bytes"], a["period"]):
+                    continue  # changed meanwhile
+                row["allowance_alerted"] = mark
+            if kind == "device":
+                self.store.update_device(ref, allowance_alerted=mark)
+            else:
+                self.store.update_person(ref, allowance_alerted=mark)
+                self._people_cache = None
+            self._allowance_event(kind, ref, name, a)
+
+    def _allowance_event(self, kind, ref, name, a):
+        _, adj, when = PERIODS[a["period"]]
+        device = kind == "device"
+        their = "its" if device else "their"
+        amounts = f"{fmt_bytes(a['used'])} of {fmt_limit(a['bytes'])} {when}."
+        if a["level"] >= 100:
+            self.event("usage", "bell-ring", f"{name} has used {their} {adj} allowance",
+                       amounts + (" To pause it, use the Starlink app." if device else " To pause their devices, use the Starlink app."),
+                       device=ref if device else None, tone="warn")
+        else:
+            pct = min(99, int(a["used"] * 100 / a["bytes"]))
+            self.event("usage", "bell-ring", f"{name} has used {pct}% of {their} {adj} allowance", amounts,
+                       device=ref if device else None)
+
+    # ---------- merged devices ----------
+    def _aliases_of(self, key):
+        """[(client_id, saved details)] merged into a device. Call with the lock held."""
+        return [(cid, self.alias_rows.get(cid) or {}) for cid, dev in self.aliases.items() if dev == key]
+
+    def _same_as(self, d, seen=None):
+        """For a new device: a known one, not connected now, with the same name. Probably the same device with a
+        new address: phones make one up for each network, and now and then a new one. Call with the lock held.
+        seen: the devices in the router's latest list, when that's fresher than their online flags."""
+        if d.get("acknowledged"):
+            return None
+        names = {n.lower() for n in (d.get("router_name"), d.get("hostname")) if n}
+        best = None
+        for o in self.devices.values():
+            if o is d or not o.get("acknowledged") or (o.get("online") and (seen is None or o["id"] in seen)):
+                continue
+            theirs = [o] + [r for _, r in self._aliases_of(o["id"])]
+            if names & {n.lower() for x in theirs for n in (x.get("router_name"), x.get("hostname")) if n}:
+                if best is None or (o.get("last_seen") or 0) > (best.get("last_seen") or 0):
+                    best = o
+        return best["id"] if best else None
+
+    def _device_out(self, d, month):
+        """What the page sees of one device. month: from _month_saved. Call with the lock held."""
+        key = d["id"]
         online = bool(d.get("online"))
-        today = self.dev_today.get(d["id"]) or (0.0, 0.0)
+        today = self.dev_today.get(key) or (0.0, 0.0)
         net = self.networks.get(d.get("domain") or "")
         iface = d.get("iface")
+        aliases = self._aliases_of(key)
         return {
             "id": d["id"], "mac": d.get("mac"), "name": display_name(d), "custom_name": d.get("custom_name"),
             "router_name": d.get("router_name"), "hostname": d.get("hostname"), "owner": d.get("owner"),
@@ -856,8 +1066,17 @@ class Collector:
             "rate_down": d.get("rate_down"), "rate_up": d.get("rate_up"), "width": d.get("width"),
             "today_down": today[0], "today_up": today[1], "is_new": not d.get("acknowledged"),
             "private_mac": private_mac(d.get("mac")), "blocked": bool(d.get("blocked")) and online,
-            "schedules": self.schedules.get(d["id"], 0),
+            "schedules": max(self.schedules.get(c, 0) for c in [key] + [cid for cid, _ in aliases]),
+            "notes": d.get("notes"), "hidden": bool(d.get("hidden")), "allowance": self._allowance_out(d, [key], month),
+            "aliases": [{"cid": cid, "name": r.get("router_name") or r.get("hostname"), "mac": r.get("mac"),
+                         "last_seen": ms(r.get("last_seen"))} for cid, r in aliases],
+            "maybe_same": self._same_as(d),
         }
+
+    def _person_out(self, p, month):
+        """Call with the lock held."""
+        return {"id": p["id"], "name": p["name"], "color": p["color"],
+                "allowance": self._allowance_out(p, self._owned(p["id"]), month)}
 
     @staticmethod
     def _point(r):
@@ -866,9 +1085,11 @@ class Collector:
     def state(self, now=None):
         now = now or time.time()
         outages = self._outages(now)
+        month, people = self._month_saved(now), self._people()
         with self.lock:
             dl, di, rl, ri = dict(self.dish_live), dict(self.dish_info), dict(self.router_live), dict(self.router_info)
-            devices = [self._device_out(d) for d in self.devices.values()]
+            devices = [self._device_out(d, month) for d in self.devices.values()]
+            people = [self._person_out(p, month) for p in people]
             points = [self._point(r) for r in list(self.live)[-5:]]
             events = list(self.events)
             home = {"day": self.day, "down": self.home_today[0], "up": self.home_today[1]}
@@ -897,7 +1118,7 @@ class Collector:
                 "power_w": power, "fastest_mbps": fastest / 1e6, **di,
             },
             "router": {"reachable": rl.get("reachable"), "updated": ms(rl.get("updated")), **ri, "networks": nets},
-            "home": home, "points": points, "devices": devices, "people": self._people(), "events": events,
+            "home": home, "points": points, "devices": devices, "people": people, "events": events,
             "speedtest": self._speedtest_out(), "tests": self.tests[:5],
             "outages": [{"start": o["start_ms"], "duration_s": o["duration_s"], "cause": o["cause"],
                          "text": OUTAGE_TEXT.get(o["cause"], o["cause"].replace("_", " ").capitalize())}
@@ -1022,8 +1243,14 @@ class Collector:
             raise KeyError(did)
         return did, d
 
-    def update_device(self, did, body):
-        key, d = self._find(did)
+    BULK_FIELDS = {"owner", "type", "hidden", "acknowledged"}
+
+    def _device_fields(self, key, body, now, allowed=None):
+        """The saved fields a change from the page sets. Raises ValueError for anything it can't accept.
+        allowed: the only keys that may appear (besides "id"), for changes to several devices at once."""
+        extra = set(body) - (allowed or set(body)) - {"id"}
+        if extra:
+            raise ValueError(f"Can't change {', '.join(sorted(extra))} for several devices at once")
         fields = {}
         if "name" in body:
             fields["custom_name"] = clean_text(body["name"], 40) or None
@@ -1036,12 +1263,26 @@ class Collector:
             if body["type"] is not None and body["type"] not in TYPES:
                 raise ValueError("Unknown device type")
             fields["type"] = body["type"]
+        if "notes" in body:
+            fields["notes"] = clean_note(body["notes"]) or None
+        if "hidden" in body:
+            if not isinstance(body["hidden"], bool):
+                raise ValueError("hidden is true or false")
+            fields["hidden"] = 1 if body["hidden"] else 0
+        if "allowance" in body:
+            fields.update(self._allowance_fields(body["allowance"], lambda period: self._used_now([key], period, now), now))
         if fields or body.get("acknowledged") is True:
             fields["acknowledged"] = 1
         if not fields:
             raise ValueError("Nothing to change")
+        return fields
+
+    def update_device(self, did, body):
+        key, d = self._find(did)
+        now = time.time()
+        fields = self._device_fields(key, body, now)
         with self.lock:
-            before = display_name(d)
+            before, was_hidden, had_allowance = display_name(d), bool(d.get("hidden")), bool(d.get("allowance_bytes"))
             d.update(fields)
             after = display_name(d)
         self.store.update_device(key, **fields)
@@ -1050,20 +1291,178 @@ class Collector:
         if "owner" in fields:
             person = next((p["name"] for p in self._people() if p["id"] == fields["owner"]), None)
             self.event("you", "tag", f"{after} now belongs to {person}" if person else f"{after} has no owner now", device=key)
+        if "hidden" in fields and bool(fields["hidden"]) != was_hidden:
+            if fields["hidden"]:
+                self.event("you", "eye-off", f"You hid {after}", "Orbit still records what it uses.", device=key)
+            else:
+                self.event("you", "eye", f"You stopped hiding {after}", device=key)
+        if fields.get("allowance_bytes"):
+            self.event("you", "bell-ring", f"You gave {after} an allowance of {fmt_limit(fields['allowance_bytes'])} "
+                       f"{PERIODS[fields['allowance_period']][0]}", device=key)
+        elif "allowance_bytes" in fields and had_allowance:
+            self.event("you", "bell-ring", f"You removed {after}'s allowance", device=key)
         self._invalidate()
+        month = self._month_saved(now)
         with self.lock:
-            return self._device_out(d)
+            return self._device_out(d, month)
+
+    def bulk_update(self, body):
+        """The same kind of change to several devices: {"changes": [{"id": "…", "owner": "me"}, …]}.
+        Each change can set owner, type, hidden and acknowledged. One activity entry covers them all."""
+        changes = body.get("changes")
+        if not isinstance(changes, list) or not changes:
+            raise ValueError("Pick at least one device")
+        if len(changes) > 500:
+            raise ValueError("Too many devices at once")
+        now = time.time()
+        plan = []
+        for ch in changes:
+            if not isinstance(ch, dict):
+                raise ValueError("Send each change as an object")
+            key, d = self._find(ch.get("id"))
+            plan.append((key, d, self._device_fields(key, ch, now, allowed=self.BULK_FIELDS)))
+        self.store.update_devices([(key, fields) for key, _, fields in plan])
+        with self.lock:
+            for _, d, fields in plan:
+                d.update(fields)
+            icon, title = self._bulk_words(plan)
+        self.event("you", icon, title, device=plan[0][0] if len(plan) == 1 else None)
+        self._invalidate()
+        return {"ok": True, "changed": len(plan)}
+
+    def _bulk_words(self, plan):
+        """(icon, title) for the activity entry of one change to several devices. Call with the lock held."""
+        n = len(plan)
+        what = display_name(plan[0][1]) if n == 1 else f"{n} devices"
+        kinds = set().union(*(f.keys() for _, _, f in plan)) - {"acknowledged"}
+        same = {k: len({f.get(k) for _, _, f in plan}) == 1 for k in kinds}
+        if kinds == {"owner"} and same["owner"]:
+            person = next((p["name"] for p in self._people() if p["id"] == plan[0][2]["owner"]), None)
+            if person:
+                return "tag", f"{what} now {'belongs' if n == 1 else 'belong'} to {person}"
+            return "tag", f"{what} {'has' if n == 1 else 'have'} no owner now"
+        if kinds == {"hidden"} and same["hidden"]:
+            return ("eye-off", f"You hid {what}") if plan[0][2]["hidden"] else ("eye", f"You stopped hiding {what}")
+        if kinds == {"type"}:
+            return "tag", f"You changed what kind of device {what} {'is' if n == 1 else 'are'}"
+        if not kinds:
+            return "shield-check", f"You marked {what} as known"
+        return "pencil", f"You changed {what}"
 
     def forget_device(self, did):
-        key, d = self._find(did)
-        if d.get("online"):
-            raise ValueError("Only offline devices can be forgotten")
+        self.forget_devices({"ids": [did]})
+
+    def forget_devices(self, body):
+        """Forget offline devices: {"ids": […]}. Their usage history stays in your totals."""
+        ids = body.get("ids")
+        if not isinstance(ids, list) or not ids:
+            raise ValueError("Pick at least one device")
+        keys = list(dict.fromkeys(self._find(i)[0] for i in ids))
+        with self.flush_lock:
+            with self.lock:
+                busy = [self.devices[k] for k in keys if self.devices[k].get("online")]
+                if busy:
+                    raise ValueError(f"{display_name(busy[0])} is connected right now. Only offline devices can be forgotten.")
+                names = []
+                for key in keys:
+                    names.append(display_name(self.devices.pop(key)))
+                    for cid in [key] + [cid for cid, _ in self._aliases_of(key)]:
+                        for table in (self.aliases, self.alias_rows, self.counters, self.recent):
+                            table.pop(cid, None)
+                    self.dev_today.pop(key, None)
+                    self.acc.pop(key, None)
+            for key in keys:
+                self.store.delete_device(key)
+        if len(names) == 1:
+            self.event("you", "trash-2", f"You forgot {names[0]}", "If it connects again, it shows up as new.")
+        else:
+            listed = ", ".join(names[:4]) + (f" and {len(names) - 4} more" if len(names) > 4 else "")
+            self.event("you", "trash-2", f"You forgot {len(names)} devices", f"{listed}. If they connect again, they show up as new.")
+        self._invalidate()
+        return {"ok": True, "forgot": len(names)}
+
+    def merge_devices(self, did, body):
+        """Two entries that are the same device become one: {"other": "<id>"}. Returns the device as it is now.
+        The one connected now, or seen last, keeps its id, so the live readings carry on. Its name, owner and
+        other settings come from the entry Orbit knew first, filled in from the other one."""
+        a_key, _ = self._find(did)
+        b_key, _ = self._find(body.get("other"))
+        if a_key == b_key:
+            raise ValueError("Pick another device to merge it with")
+        with self.flush_lock:
+            with self.lock:
+                a, b = self.devices.get(a_key), self.devices.get(b_key)
+                if a is None or b is None:
+                    raise KeyError(a_key if a is None else b_key)
+                if a.get("online") and b.get("online"):
+                    raise ValueError("Both are connected right now, so they're two different devices")
+                a_first = a.get("online") or (not b.get("online") and (a.get("last_seen") or 0) >= (b.get("last_seen") or 0))
+                keep, gone = (a, b) if a_first else (b, a)
+                base, extra = (a, b) if (a.get("first_seen") or 0) <= (b.get("first_seen") or 0) else (b, a)
+                fields = self._merged_fields(keep, base, extra)
+                gone_name = display_name(gone)
+            self.store.merge_devices(keep["id"], gone["id"], fields)
+            with self.lock:
+                keep_key, gone_key = keep["id"], gone["id"]
+                self.devices.pop(gone_key, None)
+                keep.update(fields)
+                for cid, _ in self._aliases_of(gone_key):
+                    self.aliases[cid] = keep_key
+                    self.alias_rows.setdefault(cid, {})["device"] = keep_key
+                self.aliases[gone_key] = keep_key
+                self.alias_rows[gone_key] = {"cid": gone_key, "device": keep_key, **{k: gone.get(k) for k in (
+                    "mac", "router_name", "hostname", "first_seen", "last_seen", "last_rx", "last_tx", "last_assoc_s", "last_poll")}}
+                today = self.dev_today.pop(gone_key, None)
+                if today:
+                    t = self.dev_today.setdefault(keep_key, [0.0, 0.0])
+                    t[0], t[1] = t[0] + today[0], t[1] + today[1]
+                acc = self.acc.pop(gone_key, None)
+                if acc:
+                    k = self.acc.setdefault(keep_key, [0.0, 0.0, 0.0, 0.0, 0.0, 0])
+                    k[:] = [k[0] + acc[0], k[1] + acc[1], max(k[2], acc[2]), max(k[3], acc[3]), k[4] + acc[4], k[5] + acc[5]]
+                self._month_cache = (None, {})
+                final = display_name(keep)
+        title = f"You merged {gone_name} into {final}" if gone_name != final else f"You merged two entries for {final}"
+        self.event("you", "link", title, "They're one device now, and their usage history is combined.", device=keep_key)
+        self._invalidate()
+        month = self._month_saved(time.time())
         with self.lock:
-            name = display_name(d)
-            for table in (self.devices, self.counters, self.recent, self.dev_today, self.acc):
-                table.pop(key, None)
-        self.store.delete_device(key)
-        self.event("you", "trash-2", f"You forgot {name}", "If it connects again, it shows up as new.")
+            return self._device_out(keep, month)
+
+    @staticmethod
+    def _merged_fields(keep, base, extra):
+        own = lambda d: d.get("router_name") or d.get("hostname")  # noqa: E731 (what it's called without your name)
+        name = base.get("custom_name") or extra.get("custom_name")
+        if not name and own(base) and own(base) != own(keep):
+            name = own(base)  # keep the name you know it by, when the new connection calls itself something else
+        allowance = base if base.get("allowance_bytes") else extra
+        notes = "\n".join(n for n in (base.get("notes"), extra.get("notes")) if n)[:500]
+        return {"custom_name": name, "owner": base.get("owner") or extra.get("owner"),
+                "type": base.get("type") or extra.get("type"), "notes": notes or None, "hidden": base.get("hidden") or 0,
+                "acknowledged": 1, "first_seen": base.get("first_seen") or extra.get("first_seen"),
+                **{k: allowance.get(k) for k in ("allowance_bytes", "allowance_period", "allowance_alerted")}}
+
+    def separate_alias(self, did, cid):
+        """A connection merged into a device becomes its own device again. What it used so far stays where it is."""
+        key, d = self._find(did)
+        cid = str(cid or "")
+        now = int(time.time())
+        with self.flush_lock:
+            with self.lock:
+                if self.aliases.get(cid) != key:
+                    raise KeyError(cid)
+            self.store.separate_alias(cid, now)
+            with self.lock:
+                self.aliases.pop(cid, None)
+                r = self.alias_rows.pop(cid, None) or {}
+                new = {k: r.get(k) for k in ("mac", "router_name", "hostname", "last_seen", "last_rx", "last_tx",
+                                             "last_assoc_s", "last_poll")}
+                new.update(id=cid, first_seen=r.get("first_seen") or now, custom_name=None, owner=None, type=None,
+                           acknowledged=1, online=False, hidden=0, type_guess=guess_type(r.get("router_name"), r.get("hostname")))
+                self.devices[cid] = new
+                name, other = display_name(new), display_name(d)
+        self.event("you", "unlink", f"You separated {name} from {other}",
+                   f"It's its own device again. What it used so far stays with {other}.", device=cid)
         self._invalidate()
 
     def add_person(self, body):
@@ -1086,15 +1485,31 @@ class Collector:
         self._invalidate()
         return person
 
-    def rename_person(self, pid, body):
+    def update_person(self, pid, body):
+        """Rename a person ({"name": …}), or set their allowance ({"allowance": {bytes, period} or null})."""
         people = {p["id"]: p for p in self._people()}
         if pid not in people:
             raise KeyError(pid)
-        name = clean_text(body.get("name"), 24)
-        if not name:
-            raise ValueError("A name is needed")
-        self.store.rename_person(pid, name)
-        self.event("you", "pencil", f"You renamed {people[pid]['name']} to {name}")
+        p, fields, now = people[pid], {}, time.time()
+        if "name" in body:
+            fields["name"] = clean_text(body.get("name"), 24)
+            if not fields["name"]:
+                raise ValueError("A name is needed")
+        if "allowance" in body:
+            with self.lock:
+                keys = self._owned(pid)
+            fields.update(self._allowance_fields(body["allowance"], lambda period: self._used_now(keys, period, now), now))
+        if not fields:
+            raise ValueError("Nothing to change")
+        self.store.update_person(pid, **fields)
+        name = fields.get("name", p["name"])
+        if name != p["name"]:
+            self.event("you", "pencil", f"You renamed {p['name']} to {name}")
+        if fields.get("allowance_bytes"):
+            self.event("you", "bell-ring", f"You gave {name} an allowance of {fmt_limit(fields['allowance_bytes'])} "
+                       f"{PERIODS[fields['allowance_period']][0]}", "It counts all of their devices together.")
+        elif "allowance_bytes" in fields and p.get("allowance_bytes"):
+            self.event("you", "bell-ring", f"You removed {name}'s allowance")
         self._invalidate()
 
     def delete_person(self, pid):

@@ -59,6 +59,8 @@ export const fmtShortDate = ts => new Date(ts).toLocaleDateString([], { day: 'nu
 export const fmtWeekday = ts => new Date(ts).toLocaleDateString([], { weekday: 'short' });
 export const clockOfMinutes = m => `${String(Math.floor(m / 60) % 24).padStart(2, '0')}:${String(Math.round(m % 60)).padStart(2, '0')}`;
 export const plural = (n, word, many) => `${n} ${n === 1 ? word : many || word + 's'}`;
+/* An amount you chose, like an allowance: "2 GB" rather than "2.0 GB". */
+export const fmtLimit = b => fmtBytes(b).replace(/\.0+ /, ' ');
 
 /* ---------- devices and people ---------- */
 export const TYPES = {
@@ -100,6 +102,13 @@ export function statusDetail(d, now) {
   if (d.blocked) return 'From the Starlink app';
   return d.since ? 'For ' + fmtDur(now - d.since) : 'Connected';
 }
+/* What a device is called before you name it: the router's name for it, or the name it gives itself. */
+export const ownName = d => d.router_name || d.hostname || null;
+
+/* ---------- data allowances ---------- */
+export const PERIOD = { day: { per: 'a day', when: 'today', adj: 'daily' }, month: { per: 'a month', when: 'this month', adj: 'monthly' } };
+export const allowanceTone = a => (a.used >= a.bytes ? 'crit' : a.used >= a.bytes * 0.8 ? 'warn' : 'good');
+export const allowanceText = a => `${fmtBytes(a.used)} of ${fmtLimit(a.bytes)} used ${PERIOD[a.period].when}`;
 
 /* ---------- primitives ---------- */
 export function Icon({ name, size = 18, sw = 2, className = '', style }) {
@@ -182,12 +191,56 @@ export function Menu({ trigger, children, align = '', label }) {
     ${open ? html`<div className=${'menu ' + align} role="menu" aria-label=${label} onClick=${e => { e.stopPropagation(); setOpen(false); }}>${children}</div>` : null}
   </div>`;
 }
-export function AssignMenu({ people, onPick, label = 'Choose owner', btnClass = 'btn btn-sm btn-primary', align = '', current }) {
-  return html`<${Menu} align=${align} label="Choose who uses this device" trigger=${({ toggle, open }) => html`<button type="button" className=${btnClass} aria-haspopup="menu" aria-expanded=${open ? 'true' : 'false'} onClick=${e => { e.stopPropagation(); toggle(); }}>${label}<${Icon} name="chevron-down" size=${14} /></button>`}>
+export function AssignMenu({ people, onPick, label = 'Choose owner', btnClass = 'btn btn-sm btn-primary', align = '', current, noneOption, disabled }) {
+  return html`<${Menu} align=${align} label="Choose who uses this device" trigger=${({ toggle, open }) => html`<button type="button" className=${btnClass} disabled=${disabled} aria-haspopup="menu" aria-expanded=${open ? 'true' : 'false'} onClick=${e => { e.stopPropagation(); toggle(); }}>${label}<${Icon} name="chevron-down" size=${14} /></button>`}>
     <div className="menu-label">Whose device is it?</div>
     ${people.map(p => html`<button key=${p.id} type="button" role="menuitem" onClick=${() => onPick(p.id)}><span className="pdot" style=${{ '--pc': pcol(p) }} />${p.name}${current === p.id ? html`<${Icon} name="check" size=${15} style=${{ marginLeft: 'auto' }} />` : null}</button>`)}
-    ${current ? html`<button type="button" role="menuitem" onClick=${() => onPick(null)}><${Icon} name="x" size=${15} />No owner</button>` : null}
+    ${current || noneOption ? html`<button type="button" role="menuitem" onClick=${() => onPick(null)}><${Icon} name="x" size=${15} />No owner</button>` : null}
   <//>`;
+}
+/* Pick a kind of device, for several at once. */
+export function TypeMenu({ onPick, label = 'Kind', btnClass = 'btn btn-sm', align = '', disabled }) {
+  return html`<${Menu} align=${align} label="Choose the kind of device" trigger=${({ toggle, open }) => html`<button type="button" className=${btnClass} disabled=${disabled} aria-haspopup="menu" aria-expanded=${open ? 'true' : 'false'} onClick=${e => { e.stopPropagation(); toggle(); }}>${label}<${Icon} name="chevron-down" size=${14} /></button>`}>
+    <div className="menu-scroll">
+      ${Object.entries(TYPES).map(([k, v]) => html`<button key=${k} type="button" role="menuitem" onClick=${() => onPick(k)}><${Icon} name=${v.icon} size=${16} />${v.label}</button>`)}
+    </div>
+  <//>`;
+}
+export function Switch({ on, onChange, label, id }) {
+  return html`<button type="button" id=${id} role="switch" className="switch" aria-checked=${on ? 'true' : 'false'} aria-label=${label} onClick=${() => onChange(!on)} />`;
+}
+/* How much of a data allowance is used. compact: just the bar, for lists. */
+export function AllowanceMeter({ a, compact }) {
+  const tone = allowanceTone(a);
+  const left = a.bytes - a.used;
+  return html`<div className=${'allow' + (compact ? ' compact' : '')} title=${compact ? allowanceText(a) : undefined}>
+    <div className=${'allow-bar t-' + tone} role="meter" aria-valuemin="0" aria-valuemax=${a.bytes} aria-valuenow=${Math.min(a.used, a.bytes)} aria-label=${'Allowance: ' + allowanceText(a)}>
+      <span style=${{ width: clamp((a.used / a.bytes) * 100, 1, 100) + '%' }} /></div>
+    ${compact ? null : html`<div className="allow-text"><span className="tnum">${allowanceText(a)}</span><span className=${'allow-left t-' + tone}>${left > 0 ? fmtBytes(left) + ' left' : 'Used up'}</span></div>`}
+  </div>`;
+}
+/* Set, change or remove a data allowance. a: the current one, or null. onSave({bytes, period}), or onSave(null) to remove it. */
+export function AllowanceEditor({ a, onSave, onCancel }) {
+  const [gb, setGb] = useState(a ? String(+(a.bytes / 1e9).toFixed(2)) : '');
+  const [period, setPeriod] = useState(a ? a.period : 'day');
+  const v = parseFloat(String(gb).replace(',', '.'));
+  const ok = isFinite(v) && v >= 0.01 && v <= 100000;
+  const save = e => { e.preventDefault(); if (ok) onSave({ bytes: Math.round(v * 1e9), period }); };
+  return html`<form className="allow-edit" onSubmit=${save}>
+    <div className="row wrap" style=${{ gap: '8px' }}>
+      <input className="input allow-gb tnum" type="number" inputMode="decimal" min="0.01" max="100000" step="any" value=${gb} placeholder="2"
+        onChange=${e => setGb(e.target.value)} aria-label="Allowance in gigabytes" data-autofocus="true" autoFocus=${true} />
+      <span className="ink2">GB</span>
+      <select className="select" value=${period} onChange=${e => setPeriod(e.target.value)} aria-label="How often it starts again">
+        <option value="day">a day</option><option value="month">a month</option>
+      </select>
+    </div>
+    <div className="row wrap" style=${{ gap: '8px' }}>
+      <button type="submit" className="btn btn-sm btn-primary" disabled=${!ok}>${a ? 'Save' : 'Set allowance'}</button>
+      ${onCancel ? html`<button type="button" className="btn btn-sm btn-ghost" onClick=${onCancel}>Cancel</button>` : null}
+      ${a ? html`<button type="button" className="btn btn-sm btn-ghost btn-danger" onClick=${() => onSave(null)}>Remove allowance</button>` : null}
+    </div>
+  </form>`;
 }
 export function CopyBtn({ text, ui, label = 'Copy' }) {
   const copy = e => {

@@ -4,7 +4,7 @@ import { getJSON } from './data.js';
 import { actCls } from './overview.js';
 
 const FILTERS = [{ value: 'all', label: 'All' }, { value: 'security', label: 'Security', icon: 'shield-alert' }, { value: 'devices', label: 'Devices' },
-  { value: 'network', label: 'Starlink' }, { value: 'you', label: 'Your changes' }];
+  { value: 'network', label: 'Starlink' }, { value: 'usage', label: 'Allowances' }, { value: 'you', label: 'Your changes' }];
 
 export function ActivityView({ s, ui }) {
   const [f, setF] = useState('all');
@@ -26,7 +26,7 @@ export function ActivityView({ s, ui }) {
     g.items.push(e);
   });
   return html`<div className="view">
-    <div className="page-head"><div><h1 className="page-title">Activity</h1><p className="page-sub">New devices, devices coming and going, Starlink dropouts and updates, and the changes you made, newest first.</p></div></div>
+    <div className="page-head"><div><h1 className="page-title">Activity</h1><p className="page-sub">New devices, devices coming and going, allowances running out, Starlink dropouts and updates, and the changes you made, newest first.</p></div></div>
     <${Seg} label="Filter activity" value=${f} onChange=${setF} options=${FILTERS} />
     <section className="card">
       ${groups.map(g => html`<${Fragment} key=${g.label}><div className="tl-day">${g.label}</div>

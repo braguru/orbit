@@ -74,6 +74,8 @@ To check what your own dish and router report, run the read-only probe. It write
 
 The app shows what the Orbit server on this Mac records, so the server needs to be running (`scripts/service.sh status`). The web version keeps working alongside it.
 
+The app sends a notification when a device or person uses up most or all of their data allowance. Notifications come from the app, so they appear only while it runs; its menu bar icon keeps it running after you close the window.
+
 Build it and install it in Applications:
 
 ```bash
@@ -89,12 +91,36 @@ In the app's settings (⌘,) you can make it open when you log in.
 ## What it shows
 
 - **Overview:** a health headline, latency, current use, data used today, dropouts, and a live map of devices by signal strength. It also makes suggestions, such as weak signals, unnamed devices, restarts and big downloads.
-- **Devices:** every device the router has seen, with live speed, data used today, band and signal. You can rename a device, set its type and choose its owner.
-- **People:** devices grouped by who uses them.
+- **Devices:** every device the router has seen, with live speed, data used today, band and signal.
+  - Open a device to rename it, set its type, choose its owner, add notes or give it a data allowance.
+  - **Select** lets you change several devices at once: owner, type, mark as known, hide, or forget the offline ones. On the Mac, select several rows, or right-click.
+  - **Hide** a device you don't care about, such as a smart plug. It leaves the device list, the Overview map and suggestions, and its comings and goings leave Activity. Its data still counts everywhere. Find it under **Hidden**, or by searching.
+  - **Merge** two entries for the same device. See [Merged devices](#merged-devices).
+- **People:** devices grouped by who uses them. A person can have a data allowance for all their devices together.
 - **Usage:** data used per hour or day, average use and latency over time, and breakdowns by person and by device, over 24 hours, 7 days or 30 days.
 - **Starlink:** the dish's own obstruction map, dropouts with their cause, dish and router details, and speed tests.
 - **Speed test:** the router measures download, then upload, for about 30 seconds. It uses a few hundred MB of data. Results are kept, and "In use now" is measured against the last one.
-- **Activity:** new devices, devices connecting and disconnecting, dropouts, software updates, and the changes you made.
+- **Activity:** new devices, devices connecting and disconnecting, allowances running out, dropouts, software updates, and the changes you made.
+
+### Data allowances
+
+Give a device or a person an amount of data a day or a month. A person's allowance counts all their devices together.
+
+- Orbit tells you once when 80% is used, and once when all of it is. The alert goes to Activity, shows as a toast on any open dashboard, and appears as a notification from the Mac app while it runs. The first time, macOS asks whether Orbit may send notifications.
+- What was already used when you set an allowance doesn't alert, because you see it as you set it.
+- Days and months are calendar days and months on this computer.
+- Orbit can't cut anyone off: your router only accepts that from the Starlink app. To pause a device, use the app.
+- Per-device data comes from the router, so it includes traffic inside your home, such as casting to a TV.
+
+### Merged devices
+
+Phones make up a private address for each Wi-Fi network, and now and then a new one. The router then gives the phone a new client ID, and Orbit sees a new device. That also happens when a phone moves between your main and guest Wi-Fi.
+
+- When a new device has the same name as one that isn't connected, Orbit asks whether it's the same device.
+- Merging makes the two entries one device, with their usage history added together. Either connection then counts as that device, and its coming back doesn't raise a new-device alert.
+- The merged device keeps the name and owner of the entry Orbit knew first. It keeps the ID of the one connected most recently, so live readings carry on.
+- In a device's details you can separate a merged entry again. It becomes its own device from then on. Its past use stays with the device it was merged into.
+- Two entries that are both connected at once are two devices, so Orbit won't merge them.
 
 ## How it measures
 
@@ -117,11 +143,13 @@ When tested on a Starlink Router Gen 3 (October 2026), the router allowed every 
 
 Orbit does show what you set in the app. A device that's paused or inside a schedule shows as **Blocked**, and its details say whether it has a schedule.
 
+Orbit's own settings stay in Orbit: the names, owners, notes, hidden devices, merges and data allowances you set live in `data/orbit.db`, not on the router. Allowances only warn.
+
 Orbit never restarts, stows or reconfigures the dish or router.
 
 ## Privacy and security
 
-- **What's stored:** history lives in `data/orbit.db` on this computer. Orbit never stores or shows your Wi-Fi password.
+- **What's stored:** history, and the names, notes and allowances you set, live in `data/orbit.db` on this computer. Orbit never stores or shows your Wi-Fi password.
 - **Which addresses work:** the server answers only on this computer's own addresses. That blocks other websites from reading it through DNS rebinding. Changes must come from the dashboard page itself.
 - **Signing in:** with `--lan`, other devices sign in with the access code. A signed-in device keeps a session cookie for a year, which page scripts can't read. Orbit stores only a hash of each session. After 5 wrong codes from one address, that address waits 10 minutes.
 - **MAC addresses:** the router hides the second half of every device's MAC address, so Orbit identifies devices by the router's client ID.
@@ -142,5 +170,6 @@ orbit/            the server (Python, standard library plus the Starlink gRPC li
   auth.py         sign-in for other devices when running with --lan
 web/              the dashboard (React and htm, no build step; libraries in web/vendor)
 mac/              the native Mac app (SwiftUI and Swift Charts), built with mac/build.sh
-scripts/          the probe, and service.sh for running Orbit in the background on a Mac
+scripts/          the probe, service.sh for running Orbit in the background on a Mac,
+                  and test_devices.py, which checks device management without touching the network
 ```

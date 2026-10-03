@@ -6,7 +6,8 @@ struct ActivityView: View {
     @State private var filter = "all"
     @State private var events: [Event] = []
 
-    private let filters = [("all", "All"), ("security", "Security"), ("devices", "Devices"), ("network", "Starlink"), ("you", "Your changes")]
+    private let filters = [("all", "All"), ("security", "Security"), ("devices", "Devices"), ("network", "Starlink"), ("usage", "Allowances"),
+                           ("you", "Your changes")]
 
     var body: some View {
         let groups = Dictionary(grouping: events) { Calendar.current.startOfDay(for: Format.date($0.ts)) }
@@ -51,31 +52,63 @@ struct ActivityView: View {
 }
 
 struct PeopleView: View {
+    @Environment(OrbitStore.self) private var store
     var state: OrbitState
+    @State private var editing: Person?
 
     var body: some View {
         ScrollView {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 300), spacing: 16, alignment: .top)], alignment: .leading, spacing: 16) {
-                ForEach(state.people) { p in card(name: p.name, color: Color.person(p.color), devices: state.devices.filter { $0.owner == p.id }) }
-                let unowned = state.devices.filter { $0.owner == nil }
+                ForEach(state.people) { p in card(name: p.name, color: Color.person(p.color), devices: state.devices.filter { $0.owner == p.id }, person: p) }
+                let unowned = state.devices.filter { $0.owner == nil && !$0.isHidden }
                 if !unowned.isEmpty { card(name: "No owner yet", color: .orbitNone, devices: unowned) }
             }
             .padding(24)
             Text("Choose who owns a device from its details on the Devices page.").font(.caption).foregroundStyle(.secondary).padding(.bottom, 24)
         }
         .navigationTitle("People")
+        .sheet(item: $editing) { p in PersonAllowanceSheet(person: p).environment(store) }
     }
 
-    private func card(name: String, color: Color, devices: [Device]) -> some View {
+    private func card(name: String, color: Color, devices: [Device], person: Person? = nil) -> some View {
         let live = devices.filter(\.online).reduce(0) { $0 + $1.downMbps }
         let today = devices.reduce(0) { $0 + $1.today }
-        return Card(name, subtitle: "\(Format.plural(devices.count, "device")) · \(devices.filter(\.online).count) connected",
-                    accessory: { Circle().fill(color).frame(width: 12, height: 12) }) {
+        return Card(name, subtitle: "\(Format.plural(devices.count, "device")) · \(devices.filter(\.online).count) connected", accessory: {
+            HStack(spacing: 8) {
+                if let person {
+                    Menu {
+                        Button(person.allowance == nil ? "Set an Allowance…" : "Change Allowance…") { editing = person }
+                        if person.allowance != nil {
+                            Button("Remove Allowance", role: .destructive) { store.setPersonAllowance(person.id, bytes: nil, period: "day") }
+                        }
+                    } label: { Image(systemName: "ellipsis.circle") }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help("Options for \(person.name)")
+                }
+                Circle().fill(color).frame(width: 12, height: 12)
+            }
+        }) {
             HStack(spacing: 12) {
                 VStack(alignment: .leading) { Text("Using now").font(.caption).foregroundStyle(.secondary); Text("\(Format.mbps(live)) Mbps").font(.title3.weight(.semibold)).monospacedDigit() }
                 Spacer()
                 VStack(alignment: .leading) { Text("Today").font(.caption).foregroundStyle(.secondary); Text(Format.bytes(today)).font(.title3.weight(.semibold)).monospacedDigit() }
                 Spacer()
+            }
+            if let person, let a = person.allowance {
+                Button { editing = person } label: {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Allowance: \(Format.limit(a.bytes)) \(a.per)").font(.caption.weight(.semibold))
+                        AllowanceBar(allowance: a)
+                        Text("\(Format.bytes(a.used)) of \(Format.limit(a.bytes)) used \(a.when)").font(.caption).foregroundStyle(.secondary)
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
+                }
+                .buttonStyle(.plain)
+                .help("Change \(person.name)’s allowance")
             }
             ForEach(devices) { d in
                 HStack {
@@ -86,5 +119,53 @@ struct PeopleView: View {
                 }
             }
         }
+    }
+}
+
+/// A data allowance for everything a person owns.
+struct PersonAllowanceSheet: View {
+    @Environment(OrbitStore.self) private var store
+    @Environment(\.dismiss) private var dismiss
+    var person: Person
+    @State private var gb = 10.0
+    @State private var period = "month"
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(person.allowance == nil ? "An allowance for \(person.name)" : "\(person.name)’s allowance").font(.title2.bold())
+            Text("It counts all of \(person.name)’s devices together. Orbit tells you when it’s nearly used up, and when it’s used up.")
+                .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if let a = person.allowance {
+                VStack(alignment: .leading, spacing: 4) {
+                    AllowanceBar(allowance: a)
+                    Text("\(Format.bytes(a.used)) of \(Format.limit(a.bytes)) used \(a.when)").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            HStack {
+                TextField("Amount", value: $gb, format: .number.precision(.fractionLength(0...2))).frame(width: 80).labelsHidden()
+                Text("GB")
+                Picker("Per", selection: $period) {
+                    Text("a day").tag("day")
+                    Text("a month").tag("month")
+                }
+                .labelsHidden()
+                .fixedSize()
+            }
+            Text("Orbit can’t cut anyone off, because your router only takes changes from the Starlink app. To pause their devices, use the app.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            HStack {
+                if person.allowance != nil {
+                    Button("Remove Allowance", role: .destructive) { store.setPersonAllowance(person.id, bytes: nil, period: period); dismiss() }
+                }
+                Spacer()
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button(person.allowance == nil ? "Set Allowance" : "Save") { store.setPersonAllowance(person.id, bytes: gb * 1e9, period: period); dismiss() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(gb < 0.01)
+            }
+        }
+        .padding(20)
+        .frame(width: 440)
+        .onAppear { if let a = person.allowance { gb = a.bytes / 1e9; period = a.period } }
     }
 }
