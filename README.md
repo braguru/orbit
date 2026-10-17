@@ -26,7 +26,7 @@ It downloads the latest release, checks its SHA-256, makes a Python environment,
 | Option (before the command) | What it does |
 |---|---|
 | `ORBIT_LAN=1` | Lets phones and laptops on your Wi-Fi open the dashboard. |
-| `ORBIT_VERSION=v1.0.0` | Installs that release instead of the latest. |
+| `ORBIT_VERSION=v1.0.1` | Installs that release instead of the latest. |
 | `ORBIT_INSTALL_DIR=~/Orbit` | Installs somewhere else (default `~/Applications/Orbit`). |
 | `ORBIT_NO_SERVICE=1` | Installs the code but doesn't start the background service. |
 | `ORBIT_NO_APP=1` | Skips the Mac app (`/Applications/Orbit.app`). |
@@ -248,3 +248,7 @@ scripts/          the probe, install.sh (installs a release), release.sh (builds
                   service.sh for running Orbit in the background on a Mac,
                   test_devices.py (device management), test_tripwire.py (the tripwire) and test_router.py (router alerts) and test_plan.py (floor plan saving), which check without touching the network
 ```
+
+## License
+
+MIT: use it, change it, share it. See [LICENSE](LICENSE).
