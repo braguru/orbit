@@ -344,6 +344,8 @@ class Collector:
         self._flush_devices()
         for e in (self.dish, self.router, self.dish_slow, self.router_slow):
             e.close()
+        if self.sources:
+            self.sources.close()
 
     # ---------- activity ----------
     @staticmethod
@@ -539,6 +541,8 @@ class Collector:
                 # A normal poll, not the first one after Orbit restarted or the device reconnected
                 steady = prev is not None and rx >= prev[0] and tx >= prev[1] and assoc + 5 >= prev[2]
                 down_mbps, up_mbps = self._speed(cid, down if steady else 0.0, up if steady else 0.0, t, fresh=not steady)
+                if c.get("live_mbps"):  # another router: its own speed between reads (orbit/routers.py)
+                    down_mbps, up_mbps = c["live_mbps"]
                 signal = None if wired else num(c.get("signal_strength"))
                 a = self.acc.setdefault(key, [0.0, 0.0, 0.0, 0.0, 0.0, 0])
                 a[0] += down
@@ -568,7 +572,7 @@ class Collector:
                          domain=c.get("domain") or None, signal=signal, snr=None if wired else num(c.get("snr")),
                          down_mbps=down_mbps, up_mbps=up_mbps, rate_down=num(g(c, "rx_stats.rate_mbps")),
                          rate_up=num(g(c, "tx_stats.rate_mbps")), width=num(c.get("channel_width")), offline_since=None,
-                         ap=c.get("ap_name"), wifi_name=c.get("ssid"), source=c.get("counter_source") or c.get("source"),
+                         ap=c.get("ap_name"), wifi_name=c.get("ssid"), source=c.get("counter_source") or c.get("source"), port=c.get("port"),
                          since=(t - assoc) if assoc else (d.get("since") if was_online else t))
                 if not was_online and offline_since and t - offline_since > 300 and d not in joined:
                     came.append(d)
@@ -1366,7 +1370,7 @@ class Collector:
             "upper_band": iface == "RF_5GHZ_HIGH",
             "network": ("guest" if net.get("guest") else "main") if net else ("wired" if iface == "ETH" else None),
             "ssid": (net or {}).get("ssids", {}).get(iface) or d.get("wifi_name"), "signal": d.get("signal"), "snr": d.get("snr"),
-            "ap": d.get("ap"), "source": d.get("source"),
+            "ap": d.get("ap"), "source": d.get("source"), "port": d.get("port"),
             "down_mbps": d.get("down_mbps") or 0.0 if online else 0.0, "up_mbps": d.get("up_mbps") or 0.0 if online else 0.0,
             "rate_down": d.get("rate_down"), "rate_up": d.get("rate_up"), "width": d.get("width"),
             "today_down": today[0], "today_up": today[1], "is_new": not d.get("acknowledged"),
