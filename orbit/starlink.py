@@ -21,7 +21,7 @@ TIMEOUT = 4
 # Requests that only read data. wifi_get_config also returns the Wi-Fi passwords; the collector
 # keeps only each device's name and block schedule from it.
 READ_ONLY = frozenset({"get_status", "get_history", "get_device_info", "dish_get_obstruction_map", "wifi_get_clients",
-                       "wifi_get_config", "get_speedtest_status"})
+                       "wifi_get_config", "get_speedtest_status", "get_diagnostics"})
 # Requests that make a device do something. Starting a speed test uses a few hundred MB of data.
 ACTIONS = frozenset({"start_speedtest"})
 
@@ -60,7 +60,7 @@ class Endpoint:
             self.stub_cls, self.request_cls = self.borrow.stub_cls, self.borrow.request_cls
         self.stub = self.stub_cls(self.channel)
 
-    def read(self, name):
+    def read(self, name, timeout=TIMEOUT):
         """Send one read-only request, such as "get_status", and return the reply as a dict."""
         if name not in READ_ONLY:
             raise ValueError(f"{name} is not a read-only request")
@@ -68,7 +68,7 @@ class Endpoint:
             try:
                 if self.stub is None:
                     self._connect()
-                resp = self.stub.Handle(self.request_cls(**{name: {}}), timeout=TIMEOUT)
+                resp = self.stub.Handle(self.request_cls(**{name: {}}), timeout=timeout)
             except Exception:
                 self._close()
                 raise

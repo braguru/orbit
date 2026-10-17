@@ -661,7 +661,7 @@ function pauseText(mins) {
 }
 function nextMorning() { const d = new Date(); d.setDate(d.getDate() + 1); d.setHours(7, 0, 0, 0); return d.getTime(); }
 function lastAt(h, m, now) { const d = new Date(now); d.setHours(h, m, 0, 0); if (d.getTime() > now) d.setDate(d.getDate() - 1); return d.getTime(); }
-const shortName = n => { const s = n.replace(/^Emmanuel's\s+/, ''); return s.length > 17 ? s.slice(0, 16) + '…' : s; };
+const shortName = n => { const s = n.replace(/^Alex's\s+/, ''); return s.length > 17 ? s.slice(0, 16) + '…' : s; };
 
 /* ---------- reference data ---------- */
 const TYPES = {
@@ -673,7 +673,7 @@ const TYPES = {
 };
 const STREAMERS = new Set(['tv', 'console', 'tablet']);
 const PEOPLE0 = [
-  { id: 'me', name: 'Emmanuel', color: 'me', initials: 'E' },
+  { id: 'me', name: 'Alex', color: 'me', initials: 'E' },
   { id: 'family', name: 'Family', color: 'family', initials: 'F' },
   { id: 'kids', name: 'Kids', color: 'kids', initials: 'K', bedtime: true },
   { id: 'home', name: 'Smart home', color: 'home', initials: 'H' },
@@ -738,9 +738,9 @@ function mkDevice(id, name, type, person, o, now, rnd, i) {
 function seedDevices(now, rnd) {
   const H = HOUR, M = MIN, D = DAY;
   const L = [
-    ['iphone', "Emmanuel's iPhone", 'phone', 'me', { vendor: 'Apple', model: 'iPhone 16 Pro', band: '5', signal: -47, link: 1201, mac: '8A:2F:41:C7:19:E2', privateMac: true, ip: '192.168.1.23', since: now - 3 * H - 12 * M, first: now - 214 * D, today: 2410, prof: { down: 1.6, up: 0.35, burstP: 0.07, burstMul: 11, burstLen: [2, 6] } }],
-    ['macbook', "Emmanuel's MacBook Pro", 'laptop', 'me', { vendor: 'Apple', model: 'MacBook Pro 14″', band: '5', signal: -41, link: 1201, mac: 'F4:D4:88:6A:0C:31', ip: '192.168.1.24', since: now - 6 * H - 40 * M, first: now - 388 * D, today: 6820, prof: { down: 3.6, up: 2.9, burstP: 0.03, burstMul: 7, burstLen: [3, 8] } }],
-    ['watch', "Emmanuel's Apple Watch", 'watch', 'me', { vendor: 'Apple', model: 'Apple Watch Series 10', band: '2.4', signal: -58, link: 72, mac: '3E:91:0B:57:D2:A8', privateMac: true, ip: '192.168.1.31', since: now - 3 * H - 10 * M, first: now - 190 * D, today: 92, prof: { down: 0.03, up: 0.01 } }],
+    ['iphone', "Alex's iPhone", 'phone', 'me', { vendor: 'Apple', model: 'iPhone 16 Pro', band: '5', signal: -47, link: 1201, mac: '8A:2F:41:C7:19:E2', privateMac: true, ip: '192.168.1.23', since: now - 3 * H - 12 * M, first: now - 214 * D, today: 2410, prof: { down: 1.6, up: 0.35, burstP: 0.07, burstMul: 11, burstLen: [2, 6] } }],
+    ['macbook', "Alex's MacBook Pro", 'laptop', 'me', { vendor: 'Apple', model: 'MacBook Pro 14″', band: '5', signal: -41, link: 1201, mac: 'F4:D4:88:6A:0C:31', ip: '192.168.1.24', since: now - 6 * H - 40 * M, first: now - 388 * D, today: 6820, prof: { down: 3.6, up: 2.9, burstP: 0.03, burstMul: 7, burstLen: [3, 8] } }],
+    ['watch', "Alex's Apple Watch", 'watch', 'me', { vendor: 'Apple', model: 'Apple Watch Series 10', band: '2.4', signal: -58, link: 72, mac: '3E:91:0B:57:D2:A8', privateMac: true, ip: '192.168.1.31', since: now - 3 * H - 10 * M, first: now - 190 * D, today: 92, prof: { down: 0.03, up: 0.01 } }],
     ['desktop', 'Office desktop', 'desktop', 'me', { vendor: 'Dell', model: 'OptiPlex 7010', band: 'eth', link: 1000, mac: 'B0:7B:25:1E:44:90', ip: '192.168.1.10', since: now - 9 * D - 2 * H, first: now - 501 * D, today: 4130, prof: { down: 1.1, up: 0.8, burstP: 0.04, burstMul: 14, burstLen: [3, 7] } }],
     ['tv', 'Living room TV', 'tv', 'family', { vendor: 'Samsung', model: 'QN90D 4K TV', band: '2.4', signal: -71, link: 58, mac: '70:2A:D5:9C:13:6E', ip: '192.168.1.41', since: now - 2 * H - 5 * M, first: now - 302 * D, today: 14200, prof: { pattern: 'stream', peak: 31, trickle: 0.6, up: 0.35 } }],
     ['ipad-family', 'Family iPad', 'tablet', 'family', { vendor: 'Apple', model: 'iPad Air', band: '5', signal: -55, link: 573, ip: '192.168.1.45', since: now - 48 * M, first: now - 420 * D, today: 1880, prof: { down: 1.1, up: 0.2, burstP: 0.05, burstMul: 8, burstLen: [2, 5] } }],
@@ -1094,7 +1094,7 @@ function Hero({ s, x, api, ui }) {
   const streams = Math.max(1, Math.floor(t.down / 25));
   const util = x.util;
   return html`<div className="hero-text">
-    <div className="greet"><span>${greet}, Emmanuel</span><span aria-hidden="true">·</span><span>${date}</span></div>
+    <div className="greet"><span>${greet}, Alex</span><span aria-hidden="true">·</span><span>${date}</span></div>
     <h1 className="headline">${x.health.title}</h1>
     <p className="hero-sub">${x.health.sub}</p>
     ${st.state !== 'online' ? html`<div className=${'banner ' + (st.state === 'stowed' ? 'crit' : 'warn')} role="status">
@@ -2092,7 +2092,7 @@ function snapshotFor(s) {
   };
 }
 function rulesFor(s, canAct) {
-  return `You are Orbit, the assistant inside a home network dashboard for a Starlink internet connection. This is a prototype running on simulated data; treat it as the user's real home network. The user's name is Emmanuel.
+  return `You are Orbit, the assistant inside a home network dashboard for a Starlink internet connection. This is a prototype running on simulated data; treat it as the user's real home network. The user's name is Alex.
 
 How to answer:
 - Use plain, friendly language for someone who isn't technical. Keep it short: one to four sentences, or up to five bullet points. No headings, no tables.
@@ -2129,7 +2129,7 @@ function makeTools(api, getS, note) {
       execute: a => { const p = per(a.person_id), m = mins(a.minutes); api.pausePerson(p.id, m); note(`Paused ${p.name}'s devices`); return `Paused ${p.name}'s devices ${m ? 'for ' + m + ' minutes' : 'until resumed'}.`; } },
     { name: 'resume_person', description: "Resume all of one person's paused devices. Returns a confirmation.", inputSchema: obj({ person_id: { type: 'string' } }, ['person_id']),
       execute: a => { const p = per(a.person_id); api.resumePerson(p.id); note(`Resumed ${p.name}'s devices`); return `Resumed ${p.name}'s devices.`; } },
-    { name: 'set_scene', description: "Turn a scene on or off. work: MacBook priority, streaming capped at 10 Mbps for 1 hour. movie: living room TV priority for 3 hours. dinner: pause the kids' devices for 45 minutes. pauseall: pause everyone except Emmanuel and smart home gadgets.", inputSchema: obj({ scene: { type: 'string', enum: SCENE_IDS }, on: { type: 'boolean' } }, ['scene', 'on']),
+    { name: 'set_scene', description: "Turn a scene on or off. work: MacBook priority, streaming capped at 10 Mbps for 1 hour. movie: living room TV priority for 3 hours. dinner: pause the kids' devices for 45 minutes. pauseall: pause everyone except Alex and smart home gadgets.", inputSchema: obj({ scene: { type: 'string', enum: SCENE_IDS }, on: { type: 'boolean' } }, ['scene', 'on']),
       execute: a => { const k = String(a.scene); if (!SCENES_META[k]) throw new Error('Unknown scene ' + k); const on = a.on === true || a.on === 'true'; api.scene(k, on); note(`${on ? 'Started' : 'Stopped'} ${SCENES_META[k].name}`); return `${SCENES_META[k].name} is ${on ? 'on' : 'off'}.`; } },
   ];
 }

@@ -1,0 +1,31 @@
+name: Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Python checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Orbit's libraries
+        run: pip install -r requirements.txt
+      - name: Devices, tripwire, router and floor plan
+        run: |
+          python scripts/test_devices.py
+          python scripts/test_tripwire.py
+          python scripts/test_router.py
+          python scripts/test_plan.py
+      - name: Everything imports
+        run: python -m compileall -q orbit

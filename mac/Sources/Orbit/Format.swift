@@ -68,6 +68,19 @@ extension Color {
         default: return .orbitNone
         }
     }
+
+    /// The same person colors, in the deeper shades that read well on the night-sky map.
+    static func sky(_ name: String?) -> Color {
+        switch name {
+        case "blue": return Color(hex: 0x3987E5)
+        case "orange": return Color(hex: 0xD95926)
+        case "green": return Color(hex: 0x199E70)
+        case "amber": return Color(hex: 0xC98500)
+        case "pink": return Color(hex: 0xD55181)
+        case "violet": return Color(hex: 0x8B6CF0)
+        default: return Color(hex: 0x8A95AB)
+        }
+    }
 }
 
 extension Tone {
@@ -129,8 +142,13 @@ enum Icons {
         case "eye-off": return "eye.slash"
         case "eye": return "eye"
         case "link": return "arrow.triangle.merge"
-        case "unlink": return "arrow.triangle.branch"
+        case "unlink": return "personalhotspot.slash"
         case "shield-check": return "checkmark.shield"
+        case "shield-x": return "xmark.shield"
+        case "globe": return "globe"
+        case "plug-zap": return "bolt.fill"
+        case "lock": return "lock"
+        case "lock-open": return "lock.open"
         default: return "circle"
         }
     }
@@ -161,8 +179,12 @@ struct Signal {
 }
 
 extension Device {
+    /// 2.4 GHz reaches farther and fades more slowly, so the same dBm is a better sign on it than on 5 GHz.
+    /// Every judgement of a device's signal (words, bars, radar rings) uses this adjusted level.
+    static let bandEaseDb = 6.0
+    var effSignal: Double? { signal.map { $0 + (band == "2.4" ? Self.bandEaseDb : 0) } }
     var wired: Bool { band == "eth" }
     var bandLabel: String { wired ? "Ethernet" : band.map { "\($0) GHz" } ?? "Wi-Fi" }
     var networkLabel: String { wired ? "Wired" : network == "guest" ? "Guest Wi-Fi" : "Main Wi-Fi" }
-    var connectionLabel: String { wired ? "Wired · Ethernet" : "\(network == "guest" ? "Guest · " : "")\(bandLabel) · \(Signal(signal).word)" }
+    var connectionLabel: String { wired ? "Wired · Ethernet" : "\(network == "guest" ? "Guest · " : "")\(bandLabel) · \(Signal(effSignal).word)" }
 }

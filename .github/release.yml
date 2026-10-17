@@ -1,0 +1,13 @@
+# Groups the generated release notes by the prefix on each merged branch.
+changelog:
+  exclude:
+    labels: [release]
+  categories:
+    - title: Features
+      labels: [feature]
+    - title: Fixes
+      labels: [fix]
+    - title: Chores
+      labels: [chore]
+    - title: Other changes
+      labels: ["*"]

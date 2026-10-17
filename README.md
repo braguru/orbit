@@ -13,6 +13,26 @@ Orbit runs on a computer at home and you open it in a browser. It reads from you
 
 If your Starlink router is in bypass mode, Orbit still sees the dish but can't see your devices.
 
+## Install
+
+Paste this into Terminal on the Mac that stays home:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/manu-tech-code/orbit/HEAD/scripts/install.sh | bash
+```
+
+It downloads the latest release, checks its SHA-256, makes a Python environment, and sets up the background service. Run it again any time to update; your history in `data/` is kept.
+
+| Option (before the command) | What it does |
+|---|---|
+| `ORBIT_LAN=1` | Lets phones and laptops on your Wi-Fi open the dashboard. |
+| `ORBIT_VERSION=v1.0.0` | Installs that release instead of the latest. |
+| `ORBIT_INSTALL_DIR=~/Orbit` | Installs somewhere else (default `~/Applications/Orbit`). |
+| `ORBIT_NO_SERVICE=1` | Installs the code but doesn't start the background service. |
+| `ORBIT_NO_APP=1` | Skips the Mac app (`/Applications/Orbit.app`). |
+
+You can also download the tarball from [Releases](https://github.com/manu-tech-code/orbit/releases/latest) and follow **Set up and run** below.
+
 ## Set up and run
 
 ```bash
@@ -42,7 +62,7 @@ scripts/service.sh install
 ```
 
 The service:
-- starts when you log in;
+- does not start when you log in: you start it with `scripts/service.sh start` or from the Orbit Mac app (add `--login` to the install command to make it start at login too);
 - restarts within seconds if it crashes;
 - keeps the Mac awake while it's plugged in. On battery the Mac sleeps as usual, and closing the lid always makes it sleep, so leave it plugged in with the lid open.
 
@@ -53,7 +73,7 @@ Add `--lan` to the install command to let phones open it. The access code then a
 | `scripts/service.sh status` | Shows whether it's running and recording. |
 | `scripts/service.sh logs` | Shows its log. |
 | `scripts/service.sh restart` | Restarts it. Do this after changing Orbit's code. |
-| `scripts/service.sh stop` / `start` | Stops it until you start it again or next log in, and starts it again. |
+| `scripts/service.sh stop` / `start` | Stops it until you start it again, and starts it again. |
 | `scripts/service.sh uninstall` | Removes the service. Your history stays. |
 
 Only one copy of Orbit can use a history at a time, because two would count every device's usage twice. If the service is running, `python -m orbit` in a terminal says so and quits.
@@ -70,9 +90,15 @@ To check what your own dish and router report, run the read-only probe. It write
 
 ## Mac app
 
-`mac/` holds a native Mac app, built in SwiftUI. It has a window with the same pages as the web version, and a menu bar icon that shows Starlink's latency. Click the icon for a quick look and a speed test button.
+`mac/` holds a native Mac app, built in SwiftUI. It has a window with the same pages as the web version, including the Overview's live map of your devices, and a menu bar icon that shows Starlink's latency. Click the icon for a quick look and a speed test button. On the map, point at a device for its details, or click it to open it on the Devices page.
 
 The app shows what the Orbit server on this Mac records, so the server needs to be running (`scripts/service.sh status`). The web version keeps working alongside it.
+
+**Start and stop the server from the app.** The power button in the window's toolbar (and the menu bar panel and Settings) starts, restarts and stops the server, which runs as a background service for your account (see [Keep it running in the background](#keep-it-running-in-the-background-mac)). When the server isn't running, the app shows "Orbit is stopped" with a **Start Orbit** button. Stopping asks first, because while Orbit is stopped it records nothing: no per-device usage, dropouts or alerts, and the tripwire stops watching. Stopping takes a few seconds while the server saves what it has.
+- It does the same thing as `scripts/service.sh start`, `stop` and `restart`, so the two always agree.
+- It works only when the app is set to a server on this Mac and the service has been set up once with `scripts/service.sh install`.
+- The service doesn't start by itself when you log in, so after a restart of the Mac the app shows "Orbit is stopped" until you press **Start Orbit**. (Its launch file lives in `~/Library/Application Support/Orbit`, not in `LaunchAgents`, which macOS would start at login. `scripts/service.sh install --login` puts it in `LaunchAgents` instead.)
+- A server you started yourself in a terminal isn't managed by the app. Stop that one in the terminal.
 
 The app sends a notification when a device or person uses up most or all of their data allowance. Notifications come from the app, so they appear only while it runs; its menu bar icon keeps it running after you close the window.
 
@@ -98,8 +124,13 @@ In the app's settings (⌘,) you can make it open when you log in.
   - **Merge** two entries for the same device. See [Merged devices](#merged-devices).
 - **People:** devices grouped by who uses them. A person can have a data allowance for all their devices together.
 - **Usage:** data used per hour or day, average use and latency over time, and breakdowns by person and by device, over 24 hours, 7 days or 30 days.
-- **Starlink:** the dish's own obstruction map, dropouts with their cause, dish and router details, and speed tests.
+- **Starlink:** the dish's own obstruction map, dropouts with their cause, dish and router details, and speed tests. It also shows what the router and dish report about themselves:
+  - **Connection chain:** latency and drops from the router to the dish, to Starlink's gateway and on to the internet, so you can tell a home problem from a Starlink one. Also how long your public address has stayed the same, and the power feed to the router.
+  - **Dish pointing:** the gap between where the dish points and where it wants to point, GPS satellites, and the dish's self-test.
+  - **Updates:** the running version and update state of the dish and router.
 - **Speed test:** the router measures download, then upload, for about 30 seconds. It uses a few hundred MB of data. Results are kept, and "In use now" is measured against the last one.
+- **Security:** a map of who can reach whom, and a tripwire. See [Security](#security).
+- **Floor plan:** draw your walls, place your devices, and see which ones are weaker than your walls explain. See [Floor plan](#floor-plan).
 - **Activity:** new devices, devices connecting and disconnecting, allowances running out, dropouts, software updates, and the changes you made.
 
 ### Data allowances
@@ -122,7 +153,45 @@ Phones make up a private address for each Wi-Fi network, and now and then a new 
 - In a device's details you can separate a merged entry again. It becomes its own device from then on. Its past use stays with the device it was merged into.
 - Two entries that are both connected at once are two devices, so Orbit won't merge them.
 
+## Security
+
+The **Security** page answers two questions: which devices can talk to each other, and is anything knocking on this Mac?
+
+**Who can reach whom** is worked out from your router's settings. The map draws each Wi-Fi network as a zone around the router, with walls between them.
+- On the main network every device can reach every other one. That is normal.
+- A guest network with *client isolation* on keeps each guest apart from the others, and from your main network. Each network also has its own address range, so a guest can't reach your devices at all.
+- A network with no password (an open one) is flagged. Orbit warns you in Activity, and on the Mac with a notification, if client isolation is turned off on a guest network, if a network loses its password, or if a new open network appears.
+- Click a device to see what it can reach.
+- **Router settings:** what the router is set to, read-only: each network's protection (WPA2 or none), DNS servers, secure DNS, bypass mode, channels. Orbit warns you in Activity if the DNS servers change, secure DNS is turned off, the router goes into bypass mode, the router loses its link to the dish, or its power feed reports a fault.
+
+**The tripwire** is a set of decoy doors on this Mac (ports such as 445 file sharing, 3389 remote desktop, 5900 screen sharing, 21 and 23, plus three of your own choosing: 1034, 7765 and 4967). Nothing at home should connect to them, so any connection is a probe. The exception: devices on your main Wi-Fi that you've marked as known are allowed to talk to this Mac, so they never raise an alert. Mark a device as known on the Devices page; an unknown or guest-side device is still flagged. Orbit notes who knocked and hangs up, without reading or answering. Three different doors within two minutes is reported as a scan.
+- It names the device (or the address, if the device isn't known) and draws the probe on the map. Orbit tells you once per source every 10 minutes, so a busy scanner doesn't flood Activity.
+- It needs no administrator rights. If the macOS firewall is on, it may ask once whether to allow incoming connections for Python. Choose Allow.
+- If something on the Mac already uses a door (for example Remote Login on port 22), Orbit can't watch that one and says so.
+- **To test it:** from a phone on your Wi-Fi, open `http://<this Mac's address>:1034`. The Security page shows the address and a door to try.
+- Turn it off with the switch on the Security page, or start Orbit with `ORBIT_TRIPWIRE=0`. `ORBIT_TRIPWIRE_PORTS=8445,8022` picks other doors, which a second copy for development needs.
+
+**What it can't see:**
+- Connections to other devices. The router doesn't report them, so only this Mac is watched.
+- Half-open scans. A scan that never finishes the connection (nmap's default) doesn't reach a decoy door.
+- Anything inside a guest network. Isolation drops it before anyone can see it. Guests also can't reach this Mac, so they never trigger the tripwire.
+- The router's firewall log. The router refuses to share it.
+
+`scripts/test_tripwire.py` and `scripts/test_router.py` check the tripwire and the router alerts without touching the network.
+
+## Floor plan
+
+Your router can't see walls, only how strong each device's signal is. The **Floor plan** page lets you draw the walls and shows where something is in the way.
+
+- Draw your outline and walls, choose what each is made of (plasterboard, glass, brick, concrete, metal or mirror), put the router where it is, and drag each device to where it really is. Add room names if you like.
+- For each device, Orbit predicts the signal from the distance and the walls between it and the router, then tunes that guess using all your devices (it needs at least 3 placed). The gap between what a device measures and what the plan predicts is shown: a device much weaker than the walls explain usually has something in the way, such as a metal cabinet, a mirror or a thicker wall than you drew.
+- **Coverage** shows the predicted signal room by room, for 2.4 or 5 GHz.
+- It's an estimate, good to about 6 dB. Wall losses are typical values, not measurements of your walls.
+- The plan is kept in `data/orbit.db` (as a single saved setting) and shared by the web and Mac apps. Both write it through `/api/plan`. `scripts/test_plan.py` checks what is accepted and refused.
+
 ## How it measures
+
+**How hard Orbit works the router.** The router is a small computer that also carries your Wi-Fi, so Orbit is gentle with it. It reads the client list every 2 seconds and the router's full status only every 10 minutes (`ORBIT_ROUTER_STATUS_EVERY`, in seconds). On 5 October 2026 the router began restarting itself intermittently within an hour of a build that asked for its full status every 30 seconds and for radio statistics and the router's game-server pings every minute. Orbit no longer asks for the radio statistics or the pings at all.
 
 - **Whole home:** the dish reports download and upload speed every second. Orbit saves each reading and adds them up for daily totals.
 - **Per device:** the router reports a running byte count for each device. Orbit reads it every 2 seconds and records the difference.
@@ -149,7 +218,7 @@ Orbit never restarts, stows or reconfigures the dish or router.
 
 ## Privacy and security
 
-- **What's stored:** history, and the names, notes and allowances you set, live in `data/orbit.db` on this computer. Orbit never stores or shows your Wi-Fi password.
+- **What's stored:** history, and the names, notes and allowances you set, live in `data/orbit.db` on this computer. Tripwire knocks (time, address, door) are kept for 30 days. Orbit never stores or shows your Wi-Fi password.
 - **Which addresses work:** the server answers only on this computer's own addresses. That blocks other websites from reading it through DNS rebinding. Changes must come from the dashboard page itself.
 - **Signing in:** with `--lan`, other devices sign in with the access code. A signed-in device keeps a session cookie for a year, which page scripts can't read. Orbit stores only a hash of each session. After 5 wrong codes from one address, that address waits 10 minutes.
 - **MAC addresses:** the router hides the second half of every device's MAC address, so Orbit identifies devices by the router's client ID.
@@ -159,17 +228,23 @@ Orbit never restarts, stows or reconfigures the dish or router.
   - Per-device minutes: 35 days.
   - Per-device daily totals: forever.
 
+## Releases
+
+The version is written once, in `orbit/__init__.py`. Merging into `main` runs `.github/workflows/release.yml`, which tags `v<version>` and drafts a GitHub release; from a Mac, `scripts/release.sh --upload` builds the tarball and the Mac app, attaches them with their checksums, and publishes. Bump `__version__` in a pull request to release again. `scripts/install.sh` reads the latest release, so it always installs what was published.
+
 ## Layout
 
 ```
 orbit/            the server (Python, standard library plus the Starlink gRPC library)
   starlink.py     access to the dish and router (reads, plus the speed test)
   collector.py    polls them, works out usage, runs speed tests, keeps the live picture
+  tripwire.py     the decoy doors on this Mac that catch probes
   store.py        SQLite history
   server.py       the web server, JSON API and live stream
   auth.py         sign-in for other devices when running with --lan
 web/              the dashboard (React and htm, no build step; libraries in web/vendor)
 mac/              the native Mac app (SwiftUI and Swift Charts), built with mac/build.sh
-scripts/          the probe, service.sh for running Orbit in the background on a Mac,
-                  and test_devices.py, which checks device management without touching the network
+scripts/          the probe, install.sh (installs a release), release.sh (builds one),
+                  service.sh for running Orbit in the background on a Mac,
+                  test_devices.py (device management), test_tripwire.py (the tripwire) and test_router.py (router alerts) and test_plan.py (floor plan saving), which check without touching the network
 ```

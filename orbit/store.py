@@ -3,6 +3,7 @@
 Times are Unix seconds in the database. "Days" are local calendar days on this machine.
 """
 
+import os
 import sqlite3
 import threading
 import time
@@ -53,6 +54,12 @@ CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, cat TEXT, icon TEXT, title TEXT, detail TEXT, device TEXT, tone TEXT);
 CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
 
+-- Connections to the tripwire's decoy doors on this computer. ip is the visitor's address, device the
+-- Orbit device it belonged to at the time (if any).
+CREATE TABLE IF NOT EXISTS probes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, ip TEXT, device TEXT, name TEXT, port INTEGER);
+CREATE INDEX IF NOT EXISTS probes_ts ON probes(ts);
+
 -- Speed tests run by the router. Speeds are the typical (median) and peak readings during the test.
 CREATE TABLE IF NOT EXISTS speedtests (
   ts INTEGER PRIMARY KEY, down_mbps REAL, up_mbps REAL, down_peak REAL, up_peak REAL, latency_ms REAL, error TEXT);
@@ -65,11 +72,30 @@ CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, created INTEGE
 ADDED_COLUMNS = {
     "devices": [("notes", "TEXT"), ("hidden", "INTEGER DEFAULT 0"), ("allowance_bytes", "REAL"),
                 ("allowance_period", "TEXT"), ("allowance_alerted", "TEXT")],
+    "probes": [("known", "INTEGER DEFAULT 0")],
     "people": [("allowance_bytes", "REAL"), ("allowance_period", "TEXT"), ("allowance_alerted", "TEXT")],
 }
 
 COLORS = ["blue", "orange", "green", "amber", "pink", "violet"]
-DEFAULT_PEOPLE = [("me", "Emmanuel", "blue"), ("family", "Family", "orange"),
+
+
+def account_name():
+    """The name this computer's account goes by, so a new Orbit greets its own person.
+
+    Nothing personal is written into Orbit itself: each install takes the name from
+    the account it runs under, and falls back to "Me" when there isn't one.
+    """
+    try:
+        import pwd
+        full = pwd.getpwuid(os.getuid()).pw_gecos.split(",")[0].strip()
+        if full:
+            return full
+    except Exception:
+        pass
+    return "Me"
+
+
+DEFAULT_PEOPLE = [("me", account_name(), "blue"), ("family", "Family", "orange"),
                   ("home", "Smart home", "amber"), ("guests", "Guests", "pink")]
 ALLOWANCE_FIELDS = {"allowance_bytes", "allowance_period", "allowance_alerted"}
 DEVICE_FIELDS = {"custom_name", "owner", "type", "acknowledged", "notes", "hidden"} | ALLOWANCE_FIELDS
@@ -79,6 +105,7 @@ KEEP_SAMPLES_S = 2 * 86400
 KEEP_MINUTES_S = 400 * 86400
 KEEP_DEVICE_MINUTES_S = 35 * 86400
 KEEP_EVENTS = 5000
+KEEP_PROBES_S = 30 * 86400
 
 
 class Store:
@@ -356,6 +383,14 @@ class Store:
             return self._all("SELECT * FROM events WHERE cat=? ORDER BY ts DESC, id DESC LIMIT ?", (cat, limit))
         return self._all("SELECT * FROM events ORDER BY ts DESC, id DESC LIMIT ?", (limit,))
 
+    # ---------- tripwire ----------
+    def add_probe(self, ts, ip, device, name, port, known=False):
+        self._run("INSERT INTO probes (ts, ip, device, name, port, known) VALUES (?,?,?,?,?,?)",
+                  (int(ts), ip, device, name, port, int(bool(known))))
+
+    def probes_since(self, ts):
+        return self._all("SELECT * FROM probes WHERE ts>=? ORDER BY ts", (int(ts),))
+
     # ---------- speed tests ----------
     def add_speedtest(self, ts, down, up, down_peak, up_peak, latency, error=None):
         self._run("INSERT OR REPLACE INTO speedtests VALUES (?,?,?,?,?,?,?)",
@@ -389,4 +424,5 @@ class Store:
             self.db.execute("DELETE FROM outages WHERE start_ms < ?", (int((now - KEEP_MINUTES_S) * 1000),))
             self.db.execute("DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY ts DESC LIMIT ?)",
                             (KEEP_EVENTS,))
+            self.db.execute("DELETE FROM probes WHERE ts < ?", (now - KEEP_PROBES_S,))
             self.db.execute("DELETE FROM sessions WHERE last_seen < ?", (now - 365 * 86400,))

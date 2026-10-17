@@ -211,8 +211,10 @@ c.store.add_device_days([("1003", "2026-10-08", 12e9, 0)])
 NOW[0] += 301  # the month total refreshes every 5 minutes
 poll(c, [client(1001, rx[1001], 0, assoc[1001] + 301, "My iPhone", "iPhone")], step=0)
 c._check_allowances(NOW[0])
-pa = [e for e in c.store.events(10) if e["cat"] == "usage" and "Emmanuel" in e["title"]]
-check(pa and pa[0]["title"] == "Emmanuel has used their monthly allowance" and pa[0]["device"] is None,
+# The first person is named after whoever's account Orbit runs under; use that name.
+me_name = next(p["name"] for p in json.loads(c.state_json())["people"] if p["id"] == "me")
+pa = [e for e in c.store.events(10) if e["cat"] == "usage" and me_name in e["title"]]
+check(pa and pa[0]["title"] == f"{me_name} has used their monthly allowance" and pa[0]["device"] is None,
       f"person alert: {[(e['title'], e['detail']) for e in pa]}")
 c.update_person("me", {"allowance": None})
 check(next(p for p in json.loads(c.state_json())["people"] if p["id"] == "me")["allowance"] is None, "allowance removed")

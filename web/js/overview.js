@@ -2,7 +2,7 @@
 import {
   html, useState, useMemo, useRef, Fragment, clamp, sum, enterKey, DAY, MIN, readPref, writePref,
   fmtMbps, fmtBytes, fmtDur, fmtAgo, fmtSecs, fmtClock, fmtLimit, plural, Icon, Glyph, Spark, Stat, AssignMenu, LineChart, HBars,
-  OutageStrip, useSize, personOf, pcol, devColor, devSky, ownerLabel, signalInfo, bandLabel, netLabel,
+  OutageStrip, useSize, personOf, pcol, devColor, devSky, ownerLabel, signalInfo, effSignal, bandLabel, netLabel,
   statusOf, isWired, isActive, typeIcon, PERIOD,
 } from './lib.js';
 import { ICONS } from './icons.js';
@@ -74,7 +74,7 @@ function Hero({ s, x, points, api, ui }) {
 }
 
 function Attention({ list, s, api, ui }) {
-  const weak = list.some(d => d.signal != null && d.signal < -72);
+  const weak = list.some(d => d.signal != null && effSignal(d) < -72);
   const same = d => d.maybe_same && s.devices.find(z => z.id === d.maybe_same);
   return html`<div className="banner warn" role="status">
     <span className="banner-ic"><${Icon} name="shield-alert" size=${18} /></span>
@@ -99,7 +99,7 @@ function Attention({ list, s, api, ui }) {
 
 /* ---------- the orbit map ---------- */
 const ZONES = [[272, 'Weak'], [234, 'Fair'], [202, 'Good'], [165, 'Excellent']];
-const orbitR = d => (isWired(d) ? 66 : d.signal == null ? 200 : clamp(96 + (-d.signal - 40) * 4.6, 96, 272));
+const orbitR = d => (isWired(d) ? 66 : d.signal == null ? 200 : clamp(96 + (-effSignal(d) - 40) * 4.6, 96, 272));
 const sigVal = d => (isWired(d) ? 0 : d.signal == null ? -99 : d.signal);
 const shortName = n => (n.length > 17 ? n.slice(0, 16) + '…' : n);
 function KeyGlyph({ kind }) {
@@ -152,10 +152,10 @@ function OrbitMap({ s, ui }) {
           <g className="sat-train">${[0, 1, 2, 3, 4].map(i => html`<circle key=${i} cx=${-i * 13} cy=${i * 3.4} r="1.5" style=${{ fill: 'var(--sky-ink)', opacity: 0.85 - i * 0.12 }} />`)}</g>
           ${ZONES.map(([r, l], i) => html`<circle key=${l} className="o-zone" cx="300" cy="300" r=${r} style=${{ fillOpacity: 0.016 + i * 0.012 }} />`)}
           <circle className="o-zone" cx="300" cy="300" r="66" style=${{ fillOpacity: 0, strokeDasharray: '2 4' }} />
-          <text className="o-zone-label" x="300" y=${300 - 253 + 3} textAnchor="middle">Weak</text>
-          <text className="o-zone-label" x="300" y=${300 - 218 + 3} textAnchor="middle">Fair</text>
-          <text className="o-zone-label" x="300" y=${300 - 183 + 3} textAnchor="middle">Good</text>
-          <text className="o-zone-label" x="300" y=${300 - 140} textAnchor="middle">Excellent</text>
+          <text className="o-zone-label" x="300" y=${300 - 253 + 3} textAnchor="middle">Weak · under −70 dBm</text>
+          <text className="o-zone-label" x="300" y=${300 - 218 + 3} textAnchor="middle">Fair · −70 to −63</text>
+          <text className="o-zone-label" x="300" y=${300 - 183 + 3} textAnchor="middle">Good · −63 to −55</text>
+          <text className="o-zone-label" x="300" y=${300 - 140} textAnchor="middle">Excellent · −55 or better</text>
           <text className="o-zone-label" x="300" y=${300 - 46} textAnchor="middle">Wired</text>
           <g transform="translate(300 300)">
             <circle className="pulse-ring" r="30" />
@@ -198,12 +198,12 @@ function OrbitMap({ s, ui }) {
         <div className="tip-title">${td.name}</div>
         <div className="tip-row"><span className=${'pdot' + (tp ? '' : ' is-none')} style=${{ '--pc': devColor(td, tp) }} />${ownerLabel(td, tp)} · ${statusOf(td).label}</div>
         <div className="tip-row tnum"><span className="tip-val">↓ ${fmtMbps(td.down_mbps)}</span><span className="tip-val">↑ ${fmtMbps(td.up_mbps)}</span> Mbps</div>
-        <div className="tip-row">${isWired(td) ? 'Wired connection' : `${signalInfo(td.signal).word} signal (${td.signal} dBm) · ${bandLabel(td)}`}</div>
+        <div className="tip-row">${isWired(td) ? 'Wired connection' : `${signalInfo(effSignal(td)).word} signal (${td.signal} dBm) · ${bandLabel(td)}`}</div>
       </div>` : null}
     </div>
     <div className="orbit-legend">${counts.map(c => html`<span key=${c.pid || 'none'}><span className=${'pdot' + (c.p ? '' : ' is-none')} style=${{ '--pc': c.p ? `var(--s-${c.p.color})` : 'var(--s-none)' }} />${c.p ? c.p.name : 'No owner yet'} <b style=${{ color: 'var(--sky-ink)' }}>${c.n}</b></span>`)}</div>
     <div className="orbit-keys">
-      <span><${KeyGlyph} kind="rings" />Closer to the router = stronger Wi-Fi</span>
+      <span><${KeyGlyph} kind="rings" />Closer to the middle = stronger Wi-Fi signal, not a distance. 2.4 GHz is judged 6 dB more gently.</span>
       <span><${KeyGlyph} kind="size" />Bigger = using more internet</span>
       <span><${KeyGlyph} kind="flow" />Moving dots = data flowing</span>
     </div>
@@ -323,7 +323,7 @@ function allowanceInsights(s) {
 function buildInsights(s, x) {
   const out = allowanceInsights(s);
   const conn = x.conn;
-  const weak = conn.filter(d => d.signal != null && d.signal < -72).sort((a, b) => a.signal - b.signal)[0];
+  const weak = conn.filter(d => d.signal != null && effSignal(d) < -72).sort((a, b) => effSignal(a) - effSignal(b))[0];
   if (weak) out.push({
     id: 'weak-' + weak.id, icon: 'wifi', tone: 'warn', title: `${weak.name} has a weak Wi-Fi signal`,
     body: `It’s on ${bandLabel(weak)} at ${weak.signal} dBm, so pages can load slowly and calls can break up. Moving it closer to the router, or the router somewhere more central, should help.${weak.band === '5' ? ' 2.4 GHz reaches further through walls, if the device lets you pick.' : ''}`,

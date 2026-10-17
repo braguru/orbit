@@ -6,6 +6,7 @@ Three loops run in background threads:
   slow    history and dropouts every minute; obstruction map and router info every 10 minutes
 """
 
+import ipaddress
 import json
 import math
 import os
@@ -20,7 +21,7 @@ from datetime import date, timedelta
 
 import grpc
 
-from . import __version__, starlink
+from . import __version__, starlink, tripwire as tripwire_mod
 from .starlink import Endpoint, gps_ns_to_unix
 
 # Devices are keyed by the router's client_id. The router hides the second half of every
@@ -207,6 +208,11 @@ def typical(samples):
     return statistics.median(v) if v else None
 
 
+# How often Orbit asks the router for its full status (settings, link health). Every 30 seconds was tried and
+# the router started restarting itself intermittently, so it is back to the old every-10-minutes.
+ROUTER_STATUS_EVERY = int(os.environ.get("ORBIT_ROUTER_STATUS_EVERY", "600"))
+
+
 class Collector:
     def __init__(self, store, dish=starlink.DISH, router=starlink.ROUTER):
         self.store = store
@@ -242,7 +248,17 @@ class Collector:
         self.router_live = {"reachable": None, "fails": 0}
         self.router_info = {}
         self.networks = {}
+        self.router_settings, self.router_link, self.router_update = None, None, None
+        self.dish_check = None
         self.schedules = {}  # client_id -> number of block-schedule ranges set in the Starlink app
+        self.probes = deque(maxlen=5000)  # (ts, ip, device id, name, port) knocks on the tripwire, last 24 hours
+        self.probe_alerts = {}  # ip -> {"told": ts of the last 'tried to connect' event, "scan": ts of the last 'scanning' event}
+        self.host_ip = None
+        self.tripwire_on = store.meta("tripwire") != "0" and os.environ.get("ORBIT_TRIPWIRE") != "0"
+        decoys = tripwire_mod.DECOYS
+        if os.environ.get("ORBIT_TRIPWIRE_PORTS"):  # development: other ports, so a second copy never fights the real one
+            decoys = [(int(p), tripwire_mod.label_for(int(p))) for p in os.environ["ORBIT_TRIPWIRE_PORTS"].split(",") if p]
+        self.tripwire = tripwire_mod.Tripwire(self._on_probe, decoys)
         self.speedtest = {"running": False}
         self.tests = [self._test_out(r) for r in store.speedtests(10)]
         self.fake_speedtest = os.environ.get("ORBIT_FAKE_SPEEDTEST") == "1"  # development: simulate, use no data
@@ -284,6 +300,8 @@ class Collector:
                 self.alias_rows[cid] = dict(row)
         self.home_today = list(self.store.home_bytes(day_start(now), now))
         self.dev_today = {m: list(v) for m, v in self.store.device_day_totals(self.day).items()}
+        for r in self.store.probes_since(now - 86400):
+            self.probes.append((r["ts"], r["ip"], r["device"], r["name"], r["port"], bool(r.get("known"))))
         for e in reversed(self.store.events(40)):
             self.events.appendleft(self._event_out(e))
         self.fastest_bps = self.store.fastest_down(now - 7 * 86400)
@@ -298,6 +316,8 @@ class Collector:
             t = threading.Thread(target=self._guard(fn), name=fn.__name__, daemon=True)
             t.start()
             self.threads.append(t)
+        if self.tripwire_on:
+            self.tripwire.start()
 
     def _guard(self, fn):
         def run():
@@ -312,6 +332,7 @@ class Collector:
 
     def stop(self):
         self.stopping.set()
+        self.tripwire.stop()
         for t in self.threads:
             t.join(timeout=8)
         self._flush_samples()
@@ -354,6 +375,7 @@ class Collector:
         down = num(st.get("downlink_throughput_bps")) or 0.0
         up = num(st.get("uplink_throughput_bps")) or 0.0
         info, obs, cfg = st.get("device_info") or {}, st.get("obstruction_stats") or {}, st.get("config") or {}
+        al, gps = st.get("alignment_stats") or {}, st.get("gps_stats") or {}
         alerts = sorted(k for k, v in (st.get("alerts") or {}).items() if v is True)
         out = None
         if outage:
@@ -374,6 +396,14 @@ class Collector:
                 "update_state": st.get("software_update_state"), "service": st.get("class_of_service"),
                 "dl_limit": st.get("dl_bandwidth_restricted_reason"), "ul_limit": st.get("ul_bandwidth_restricted_reason"),
                 "snow_melt": cfg.get("snow_melt_mode"), "update_hour": num(cfg.get("swupdate_reboot_hour")),
+                "update_ready": bool(st.get("swupdate_reboot_ready")), "update_wait_s": num(st.get("seconds_until_swupdate_reboot_possible")),
+                "deferral": bool(cfg.get("swupdate_three_day_deferral_enabled")),
+                "reboot_reason": (st.get("reboot_reason") or "").replace("REBOOT_REASON_", "") or None,
+                "pointing": {"az": num(al.get("boresight_azimuth_deg")), "el": num(al.get("boresight_elevation_deg")),
+                             "want_az": num(al.get("desired_boresight_azimuth_deg")), "want_el": num(al.get("desired_boresight_elevation_deg")),
+                             "tilt": num(al.get("tilt_angle_deg")), "uncertainty": num(al.get("attitude_uncertainty_deg")),
+                             "settled": al.get("attitude_estimation_state") == "FILTER_CONVERGED"},
+                "gps": {"valid": bool(gps.get("gps_valid")), "sats": int(num(gps.get("gps_sats")) or 0)},
                 "sleep": {"on": bool(cfg.get("power_save_mode")), "start_min": num(cfg.get("power_save_start_minutes")),
                           "duration_min": num(cfg.get("power_save_duration_minutes"))},
             }
@@ -666,13 +696,19 @@ class Collector:
 
     # ---------- slow loop ----------
     def _slow_loop(self):
-        due = {"history": 0.0, "info": 0.0, "prune": time.time() + 120}
+        due = {"history": 0.0, "info": 0.0, "router": 0.0, "extras": 0.0, "prune": time.time() + 120}
         while not self.stopping.is_set():
             t = time.time()
             if t >= due["history"]:
                 due["history"] = t + (60 if self._history() else 15)
             if t >= due["info"]:
                 due["info"] = t + (600 if self._info() else 60)
+            # The router is a small computer that also carries your Wi-Fi. Orbit asks it for its full status only
+            # every 10 minutes (as it did before the Security and Starlink pages were added).
+            if t >= due["router"]:
+                due["router"] = t + (ROUTER_STATUS_EVERY if self._router_status() else 60)
+            if t >= due["extras"]:
+                due["extras"] = t + (600 if self._dish_check_read() else 120)
             if t >= due["prune"]:
                 self.store.prune(t)
                 with self.lock:
@@ -769,33 +805,296 @@ class Collector:
                                     "frame": om.get("map_reference_frame"), "updated": ms(time.time())}
         except Exception:
             ok = False
+        return ok
+
+    # ---------- the router's own status: networks, settings, link health ----------
+
+    @staticmethod
+    def _security_of(bss):
+        """How a network is protected, from the name of the auth block. Never the password itself."""
+        for b in bss:
+            for k in b:
+                if k.startswith("auth_"):
+                    return {"auth_open": "open", "auth_wpa2": "wpa2", "auth_wpa3": "wpa3", "auth_wpa": "wpa",
+                            "auth_wpa2_wpa3": "wpa2/wpa3"}.get(k, k[5:] or "other")
+        return None
+
+    def _router_status(self):
+        """Read the router's get_status once. It holds the Wi-Fi passwords in its config section,
+        so only the fields below are kept and the rest is dropped right away."""
         try:
-            # The router answers get_status with its Wi-Fi status. Its config section also holds the Wi-Fi
-            # passwords, so only the fields below are kept and the rest is dropped right away.
             rs = self.router_slow.read("get_status")
+        except Exception:
+            return False
+        try:
+            c = rs.get("config") or {}
             nets = {}
-            for n in g(rs, "config.networks") or []:
+            for n in c.get("networks") or []:
                 ssids = {b.get("band"): b.get("ssid") for b in n.get("basic_service_sets") or [] if b.get("ssid")}
+                bss = n.get("basic_service_sets") or []
                 nets[n.get("domain") or ""] = {"guest": bool(n.get("guest")), "isolated": bool(n.get("client_isolation")),
-                                               "subnet": n.get("ipv4"), "ssids": ssids}
+                                               "subnet": n.get("ipv4"), "ssids": ssids,
+                                               "open": any("auth_open" in b for b in bss),
+                                               "security": self._security_of(bss),
+                                               "hidden": any(b.get("hidden") for b in bss),
+                                               "enabled": any(not b.get("disable") for b in bss)}
             info = rs.get("device_info") or {}
             router_info = {"hardware": info.get("hardware_version"), "software": info.get("software_version"),
-                           "uptime_s": num(g(rs, "device_state.uptime_s")), "bypass": bool(g(rs, "config.bypass_mode"))}
-            # Block schedules set in the Starlink app, per device. Orbit can show them but not change them.
-            confs = g(rs, "config.client_configs")
+                           "uptime_s": num(g(rs, "device_state.uptime_s")), "bypass": bool(c.get("bypass_mode"))}
+            confs = c.get("client_configs")
             if confs is None:
                 confs = g(self.router_slow.read("wifi_get_config"), "wifi_config.client_configs") or []
             schedules = {}
-            for c in confs:
-                ranges = sum(len(s.get("block_ranges") or []) for s in c.get("weekly_block_schedules") or [])
-                if c.get("client_id") and ranges:
-                    schedules[str(c["client_id"])] = ranges
+            for cc in confs:
+                ranges = sum(len(s.get("block_ranges") or []) for s in cc.get("weekly_block_schedules") or [])
+                if cc.get("client_id") and ranges:
+                    schedules[str(cc["client_id"])] = ranges
+            widths = lambda v: None if not v or str(v).endswith("DEFAULT") else str(v).split("_")[-1].replace("MHZ", " MHz")
+            servers = [str(s) for s in c.get("nameservers") or []]
+            settings = {
+                "country": c.get("country_code"), "dns": {"servers": servers, "custom": bool(servers), "secure": bool(c.get("secure_dns"))},
+                "bypass": bool(c.get("bypass_mode")), "ap_mode": bool(c.get("ap_mode")), "repeater": bool(c.get("is_repeater")),
+                "dfs": bool(c.get("dfs_enabled")), "mesh_onboarding": not c.get("disable_mesh_onboarding"),
+                "channels": {"2.4": int(num(c.get("channel_2ghz")) or 0), "5": int(num(c.get("channel_5ghz")) or 0),
+                             "5_upper": int(num(c.get("channel_5ghz_high")) or 0)},  # 0 = chosen automatically
+                "widths": {"5": widths(c.get("vht_bandwidth")), "5_upper": widths(c.get("vht_bandwidth_5ghz_high"))},
+                "auto_speedtests": not c.get("disable_automated_speedtests"), "public_services": bool(c.get("use_public_services")),
+            }
+            poe = rs.get("poe_stats") or {}
+            faults = int(sum(num(v) or 0 for k, v in poe.items() if k.startswith("poe_faults")))
+            link = {
+                "internet_ms": num(rs.get("ping_latency_ms")), "dish_ms": num(rs.get("dish_ping_latency_ms")),
+                "pop_ms": num(rs.get("pop_ping_latency_ms")), "internet_drop_5m": num(rs.get("ping_drop_rate_5m")),
+                "dish_drop_5m": num(rs.get("dish_ping_drop_rate_5m")), "pop_drop_5m": num(rs.get("pop_ping_drop_rate_5m")),
+                "no_wan_link": bool(rs.get("no_wan_link")), "public_ip_age_s": num(rs.get("secs_since_last_public_ipv4_change")),
+                "poe": {"on": poe.get("poe_state") == "POE_STATE_ON", "power_w": num(poe.get("poe_power")), "faults": faults},
+            }
+            sw = rs.get("software_update_stats") or {}
+            update = {"state": sw.get("state"), "running": sw.get("running_version") or info.get("software_version"),
+                      "pending": sw.get("version_in_progress") or None, "progress": num(sw.get("software_download_progress"))}
             del rs, confs
             with self.lock:
+                before, was = self.networks, (self.router_settings, self.router_link)
                 self.networks, self.router_info, self.schedules = nets, router_info, schedules
+                self.router_settings, self.router_link, self.router_update = settings, link, update
+            self._network_changes(before, nets)
+            self._settings_changes(was[0], settings, was[1], link)
+            return True
+        except Exception:
+            traceback.print_exc()
+            return False
+
+    def _settings_changes(self, old, new, old_link, link):
+        """Tell the user about changes to the router's settings and link. The first reading is not a change."""
+        if not old:
+            return
+        if old["dns"]["servers"] != new["dns"]["servers"]:
+            now_s = ", ".join(new["dns"]["servers"]) or "the router's own"
+            self.event("security", "shield-alert", "Your router's DNS servers changed",
+                       f"Now using {now_s}. DNS decides where website names lead, so unexpected changes can send you to fake sites.", tone="warn")
+        if old["dns"]["secure"] != new["dns"]["secure"]:
+            self.event("security", "shield-check" if new["dns"]["secure"] else "shield-x",
+                       "Secure DNS was turned " + ("on" if new["dns"]["secure"] else "off"), tone="good" if new["dns"]["secure"] else "warn")
+        if new["bypass"] and not old["bypass"]:
+            self.event("network", "router", "Your router went into bypass mode", "Orbit can't see devices while another router handles your Wi-Fi.", tone="warn")
+        if old_link:
+            age, was = link.get("public_ip_age_s"), old_link.get("public_ip_age_s")
+            if age is not None and was is not None and age + 60 < was:
+                self.event("network", "globe", "Your public internet address changed", "Starlink gave your home a new address.")
+            if link["poe"]["faults"] > old_link["poe"]["faults"]:
+                self.event("network", "plug-zap", "The router's power feed reported a fault", "Check the cable between the dish and router.", tone="warn")
+            if link["no_wan_link"] and not old_link["no_wan_link"]:
+                self.event("network", "unlink", "The router lost its link to the dish", tone="crit")
+
+    def _dish_check_read(self):
+        """The dish's own hardware self-test. It talks to the dish, not the router."""
+        ok = True
+        try:
+            d = self.dish_slow.read("get_diagnostics")
+            with self.lock:
+                self.dish_check = {"self_test": d.get("hardware_self_test"), "codes": [str(x) for x in d.get("hardware_self_test_codes") or []],
+                                   "disablement": d.get("disablement_code"), "stowed": bool(d.get("stowed")),
+                                   "updated": ms(time.time())}
         except Exception:
             ok = False
         return ok
+
+    def _network_changes(self, before, now_nets):
+        """Tell the user when a Wi-Fi network's protection changes. The first reading after a start is not a change."""
+        if not before:
+            return
+        for dom, n in now_nets.items():
+            old = before.get(dom)
+            name = next(iter((n.get("ssids") or {}).values()), None) or ("Guest Wi-Fi" if n.get("guest") else "Main Wi-Fi")
+            if old is None:
+                if n.get("open") and n.get("enabled"):
+                    self.event("security", "shield-alert", f"A Wi-Fi network without a password appeared: {name}",
+                               "Anyone nearby can join it. Guests are kept apart only while client isolation is on.", tone="warn")
+                continue
+            if n.get("guest") and old.get("isolated") and not n.get("isolated"):
+                self.event("security", "shield-x", f"Client isolation was turned off on {name}",
+                           "Devices on this network can now reach each other." + (" It has no password, so strangers can join." if n.get("open") else ""),
+                           tone="crit")
+            elif n.get("guest") and not old.get("isolated") and n.get("isolated"):
+                self.event("security", "shield-check", f"Client isolation is back on for {name}",
+                           "Each device on this network is kept apart again.", tone="good")
+            if n.get("open") and not old.get("open") and n.get("enabled"):
+                self.event("security", "shield-alert", f"{name} no longer has a password", "Anyone nearby can join it.", tone="crit")
+            elif old.get("open") and not n.get("open") and n.get("enabled"):
+                self.event("security", "lock", f"{name} now has a password", tone="good")
+
+    # ---------- floor plan ----------
+    PLAN_MATERIALS = {"drywall", "glass", "brick", "concrete", "metal"}
+
+    def get_plan(self):
+        raw = self.store.meta("floorplan")
+        return {"plan": json.loads(raw) if raw else None, "rev": int(self.store.meta("floorplan_rev") or 0)}
+
+    def set_plan(self, body):
+        """Keep the floor plan the user drew: walls, the router, room names and where each device sits.
+        Everything is checked and rebuilt field by field, so only numbers and short words are ever stored."""
+        def pt(v, w, h):
+            if not (isinstance(v, (list, tuple)) and len(v) == 2 and all(isinstance(n, (int, float)) and not isinstance(n, bool) for n in v)):
+                raise ValueError("A point needs two numbers")
+            return [round(min(max(float(v[0]), 0), w), 3), round(min(max(float(v[1]), 0), h), 3)]
+        def num_(v, lo, hi, what):
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or not lo <= v <= hi:
+                raise ValueError(f"{what} must be a number from {lo} to {hi}")
+            return float(v)
+        w, h = num_(body.get("w"), 4, 40, "The width"), num_(body.get("h"), 4, 40, "The depth")
+        router = body.get("router")
+        if not isinstance(router, dict):
+            raise ValueError("The plan needs a router position")
+        r = pt([router.get("x"), router.get("y")], w, h)
+        walls, rooms, devices = [], [], {}
+        for i, x in enumerate(body.get("walls") or []):
+            if len(walls) >= 300:
+                raise ValueError("Too many walls")
+            if not isinstance(x, dict) or x.get("mat") not in self.PLAN_MATERIALS:
+                raise ValueError("A wall needs a known material")
+            walls.append({"id": str(x.get("id") or f"w{i}")[:20], "a": pt(x.get("a"), w, h), "b": pt(x.get("b"), w, h), "mat": x["mat"]})
+        for i, x in enumerate(body.get("rooms") or []):
+            if len(rooms) >= 40:
+                raise ValueError("Too many room names")
+            if not isinstance(x, dict) or not isinstance(x.get("name"), str) or not x["name"].strip():
+                raise ValueError("A room needs a name")
+            p = pt([x.get("x"), x.get("y")], w, h)
+            rooms.append({"id": str(x.get("id") or f"r{i}")[:20], "name": x["name"].strip()[:30], "x": p[0], "y": p[1]})
+        for did, x in (body.get("devices") or {}).items():
+            if len(devices) >= 200:
+                raise ValueError("Too many devices")
+            if not isinstance(x, dict) or not re.fullmatch(r"[0-9]{1,20}", str(did)):
+                raise ValueError("A device needs its id and a position")
+            p = pt([x.get("x"), x.get("y")], w, h)
+            devices[str(did)] = {"x": p[0], "y": p[1]}
+        plan = {"v": 1, "w": w, "h": h, "router": {"x": r[0], "y": r[1]}, "walls": walls, "rooms": rooms, "devices": devices}
+        rev = int(time.time() * 1000)
+        self.store.set_meta("floorplan", json.dumps(plan, separators=(",", ":")))
+        self.store.set_meta("floorplan_rev", rev)
+        with self.lock:
+            self._state_cache = (0.0, b"")
+        return {"ok": True, "rev": rev}
+
+    # ---------- tripwire ----------
+    def _network_of(self, ip):
+        """(kind, domain) for an address on one of the router's networks; ('outside', None) for anything else."""
+        try:
+            a = ipaddress.ip_address(ip)
+        except ValueError:
+            return "outside", None
+        for dom, n in self.networks.items():
+            try:
+                if a in ipaddress.ip_interface(n.get("subnet") or "").network:
+                    return ("guest" if n.get("guest") else "main"), dom
+            except ValueError:
+                continue
+        return "outside", None
+
+    def _device_at(self, ip):
+        """The device using this address. Call with the lock held."""
+        hits = [d for d in self.devices.values() if d.get("ip") == ip]
+        hits.sort(key=lambda d: (not d.get("online"), -(d.get("last_seen") or 0)))
+        return hits[0] if hits else None
+
+    def _on_probe(self, ts, ip, port):
+        """Someone connected to a decoy door on this computer. Runs on the tripwire's thread."""
+        with self.lock:
+            dev = self._device_at(ip)
+            did, name = (dev["id"], display_name(dev)) if dev else (None, None)
+            kind, _ = self._network_of(ip)
+            # A device you've marked as known, on your main Wi-Fi, is allowed to talk to this Mac: it's listed, but raises no alert.
+            known = bool(dev and kind == "main" and dev.get("acknowledged"))
+            self.probes.append((ts, ip, did, name, port, known))
+            if known:
+                self._state_cache = (0.0, b"")
+        if known:
+            self.store.add_probe(ts, ip, did, name, port, True)
+            return
+        with self.lock:
+            recent = {r[4] for r in self.probes if r[1] == ip and ts - r[0] <= 120 and not r[5]}
+            told = self.probe_alerts.setdefault(ip, {})
+            who = name or ip
+            scan = len(recent) >= 3 and ts - told.get("scan", 0) > 1800
+            touch = not scan and ts - max(told.get("told", 0), told.get("scan", 0)) > 600
+            if scan:
+                told["scan"] = ts
+            elif touch:
+                told["told"] = ts
+            self._state_cache = (0.0, b"")
+        self.store.add_probe(ts, ip, did, name, port)
+        where = "" if kind != "outside" else " It isn’t on any of your Wi-Fi networks, which should not be possible."
+        if scan:
+            self.event("security", "radar", f"{who} is scanning this Mac",
+                       f"It tried {len(recent)} different doors in 2 minutes, which is what a scanner does.{where}", device=did, tone="crit", ts=ts)
+        elif touch:
+            self.event("security", "shield-alert", f"{who} tried to connect to this Mac",
+                       f"{tripwire_mod.label_for(port, self.tripwire.decoys)} (port {port}). Nothing at home should knock there.{where}",
+                       device=did, tone="warn", ts=ts)
+
+    def set_tripwire(self, body):
+        on = body.get("on")
+        if not isinstance(on, bool):
+            raise ValueError("on must be true or false")
+        self.store.set_meta("tripwire", "1" if on else "0")
+        with self.lock:
+            self.tripwire_on = on
+            self._state_cache = (0.0, b"")
+        (self.tripwire.start if on else self.tripwire.stop)()
+        self.event("you", "shield-check" if on else "shield-x", "You turned the tripwire on" if on else "You turned the tripwire off",
+                   "Orbit listens for anything knocking on this Mac." if on else "Orbit no longer watches for probes on this Mac.")
+        return {"ok": True}
+
+    def _security_out(self, now):
+        """Call with the lock held."""
+        by = {}
+        for ts, ip, did, name, port, known in self.probes:
+            if ts < now - 86400:
+                continue
+            s = by.setdefault(ip, {"ip": ip, "first": ts, "last": ts, "tries": 0, "ports": {}, "device": did, "name": name, "known": known})
+            s["known"] = s["known"] and known
+            s["last"], s["tries"] = max(s["last"], ts), s["tries"] + 1
+            s["ports"][port] = s["ports"].get(port, 0) + 1
+            if did:
+                s["device"], s["name"] = did, name
+        sources = []
+        for s in sorted(by.values(), key=lambda x: -x["last"])[:20]:
+            kind, dom = self._network_of(s["ip"])
+            # Known is judged by who the device is now, so marking a device as known also settles its earlier knocks.
+            dev = self.devices.get(s["device"]) if s["device"] else None
+            s["known"] = bool(dev and kind == "main" and dev.get("acknowledged"))
+            sources.append({"ip": s["ip"], "device": s["device"], "name": s["name"], "network": kind, "domain": dom,
+                            "first": ms(s["first"]), "last": ms(s["last"]), "tries": s["tries"], "scan": len(s["ports"]) >= 3 and not s["known"],
+                            "known": s["known"],
+                            "ports": [{"port": p, "label": tripwire_mod.label_for(p, self.tripwire.decoys), "tries": n}
+                                      for p, n in sorted(s["ports"].items(), key=lambda kv: -kv[1])]})
+        if self.host_ip is None:
+            self.host_ip = next((a for a in tripwire_mod.local_addresses() if a.startswith("192.168.")), "")
+        host = self._device_at(self.host_ip) if self.host_ip else None
+        lbl = lambda p: {"port": p, "label": tripwire_mod.label_for(p, self.tripwire.decoys)}
+        return {"tripwire": {"on": self.tripwire_on, "running": self.tripwire.running, "since": ms(self.tripwire.since),
+                             "listening": [lbl(p) for p in self.tripwire.listening], "busy": [lbl(p) for p in self.tripwire.busy],
+                             "dropped": self.tripwire.dropped, "host_ip": self.host_ip, "host_device": host["id"] if host else None},
+                "probes": sources}
 
     # ---------- speed tests ----------
     @staticmethod
@@ -1095,6 +1394,10 @@ class Collector:
             home = {"day": self.day, "down": self.home_today[0], "up": self.home_today[1]}
             nets = [{"domain": k, **v} for k, v in self.networks.items()]
             fastest, power = self.fastest_bps, self.power_w
+            security = self._security_out(now)
+            plan_rev = int(self.store.meta("floorplan_rev") or 0)
+            rsettings, rlink, rupdate = self.router_settings, self.router_link, self.router_update
+            dcheck = self.dish_check
         devices.sort(key=lambda x: (not x["online"], -(x["down_mbps"] + x["up_mbps"]), x["name"].lower()))
         uptime = dl.get("uptime")
         boot = now - uptime if uptime else None
@@ -1115,9 +1418,11 @@ class Collector:
                 "obstructed_now": dl.get("obstructed_now"), "obstruction_valid_s": dl.get("obstruction_valid_s"),
                 "alerts": [{"key": k, "text": ALERT_TEXT.get(k, (k.replace("_", " ").capitalize(), "warn"))[0],
                             "tone": ALERT_TEXT.get(k, ("", "warn"))[1]} for k in dl.get("alerts") or []],
-                "power_w": power, "fastest_mbps": fastest / 1e6, **di,
+                "power_w": power, "fastest_mbps": fastest / 1e6, **di, "check": dcheck,
             },
-            "router": {"reachable": rl.get("reachable"), "updated": ms(rl.get("updated")), **ri, "networks": nets},
+            "router": {"reachable": rl.get("reachable"), "updated": ms(rl.get("updated")), **ri, "networks": nets,
+                       "settings": rsettings, "link": rlink, "update": rupdate},
+            "security": security, "plan_rev": plan_rev,
             "home": home, "points": points, "devices": devices, "people": people, "events": events,
             "speedtest": self._speedtest_out(), "tests": self.tests[:5],
             "outages": [{"start": o["start_ms"], "duration_s": o["duration_s"], "cause": o["cause"],

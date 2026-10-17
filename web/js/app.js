@@ -11,6 +11,8 @@ import { PeopleView, PersonModal, AllowanceModal } from './people.js';
 import { UsageView } from './usage.js';
 import { StarlinkView } from './starlink.js';
 import { ActivityView } from './activity.js';
+import { SecurityView, activeProbes } from './security.js';
+import { PlanView } from './plan.js';
 
 const FONTS = 'https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,500..800&family=Atkinson+Hyperlegible+Mono:wght@400;500&family=Atkinson+Hyperlegible+Next:wght@400;500;600;700&display=swap';
 const VIEWS = [
@@ -19,6 +21,8 @@ const VIEWS = [
   { id: 'people', label: 'People', icon: 'users-round' },
   { id: 'usage', label: 'Usage', icon: 'chart-no-axes-column' },
   { id: 'starlink', label: 'Starlink', icon: 'satellite-dish' },
+  { id: 'security', label: 'Security', icon: 'shield' },
+  { id: 'plan', label: 'Floor plan', short: 'Plan', icon: 'layout-grid' },
   { id: 'activity', label: 'Activity', icon: 'activity' },
 ];
 
@@ -141,6 +145,9 @@ function makeApi(getS, refresh, ui) {
     removePerson(id) {
       const p = personOf(getS().people, id);
       send('DELETE', `/api/people/${id}`).then(() => { refresh(); ui.toast({ icon: 'user', text: `Removed ${p ? p.name : 'that person'}`, sub: 'Their devices have no owner now.' }); }, fail);
+    },
+    setTripwire(on) {
+      return send('POST', '/api/security/tripwire', { on }).then(() => { refresh(); ui.toast({ icon: on ? 'shield-check' : 'shield-x', text: on ? 'Tripwire is on' : 'Tripwire is off', ttl: 3000 }); }, fail);
     },
     speedtest() {
       post('/api/speedtest', {}).catch(fail);
@@ -309,11 +316,13 @@ function App() {
       ${conn === 'lost' ? html`<p className="muted" style=${{ marginTop: '6px', maxWidth: '40ch' }}>Start it on the computer it runs on with <span className="mono">.venv/bin/python -m orbit</span>, then reload this page.</p>` : null}</div></div>`;
   }
   const x = derive(s);
-  const badge = id => (id === 'devices' && x.unknown.length ? html`<span className="nav-count" aria-label=${x.unknown.length + ' new'}>${x.unknown.length}</span>` : null);
+  const probing = activeProbes(s).length;
+  const badge = id => (id === 'devices' && x.unknown.length ? html`<span className="nav-count" aria-label=${x.unknown.length + ' new'}>${x.unknown.length}</span>`
+    : id === 'security' && probing ? html`<span className="nav-count" aria-label=${probing + ' probing'}>${probing}</span>` : null);
   const props = { s, x, points, devHist, api, ui };
   const viewEl = view === 'devices' ? html`<${DevicesView} ...${props} />` : view === 'people' ? html`<${PeopleView} ...${props} />`
     : view === 'usage' ? html`<${UsageView} ...${props} />` : view === 'starlink' ? html`<${StarlinkView} ...${props} />`
-    : view === 'activity' ? html`<${ActivityView} ...${props} />` : html`<${Overview} ...${props} />`;
+    : view === 'security' ? html`<${SecurityView} ...${props} />` : view === 'plan' ? html`<${PlanView} ...${props} />` : view === 'activity' ? html`<${ActivityView} ...${props} />` : html`<${Overview} ...${props} />`;
   let modalEl = null;
   if (modal) {
     if (modal.type === 'person') modalEl = html`<${PersonModal} s=${s} api=${api} ui=${ui} person=${modal.person} />`;
@@ -353,7 +362,7 @@ function App() {
         ${viewEl}
       </main>
     </div>
-    <nav className="tabbar" aria-label="Main navigation">${VIEWS.map(v => html`<button key=${v.id} type="button" className="tab" aria-current=${view === v.id ? 'page' : undefined} onClick=${() => ui.go(v.id)}><${Icon} name=${v.icon} size=${21} />${v.label}${badge(v.id)}</button>`)}</nav>
+    <nav className="tabbar" aria-label="Main navigation">${VIEWS.map(v => html`<button key=${v.id} type="button" className="tab" aria-current=${view === v.id ? 'page' : undefined} aria-label=${v.short ? v.label : undefined} onClick=${() => ui.go(v.id)}><${Icon} name=${v.icon} size=${21} />${v.short || v.label}${badge(v.id)}</button>`)}</nav>
     ${drawer ? html`<${DeviceDrawer} id=${drawer} s=${s} devHist=${devHist} api=${api} ui=${ui} />` : null}
     ${modalEl}
     <${Toasts} toasts=${toasts} close=${closeToast} />

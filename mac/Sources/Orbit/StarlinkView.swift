@@ -57,12 +57,20 @@ struct StarlinkView: View {
                 }
 
                 EqualRow(spacing: 16) {
+                    ConnectionChainCard(router: s.router)
+                    PointingCard(dish: d)
+                }
+
+                EqualRow(spacing: 16) {
                     Card("Dish", subtitle: d.hardware) {
                         Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
                             row("Software", d.software ?? "–")
+                            row("Updates", dishUpdate(d))
                             row("Up for", d.uptimeS.map { Format.duration(ms: $0 * 1000) } ?? "–")
                             row("Snow melt", ["AUTO": "Automatic", "ALWAYS_ON": "Pre-heat", "ALWAYS_OFF": "Off"][d.snowMelt ?? ""] ?? d.snowMelt ?? "–")
                             row("Sleep schedule", d.sleep?.on == true ? "On" : "Off")
+                            row("Update hour", d.updateHour.map { String(format: "%02d:00", Int($0)) } ?? "–")
+                            row("3-day update deferral", d.deferral.map { $0 ? "On" : "Off" } ?? "–")
                             row("Motors", d.actuated == true ? "Yes, it can stow itself" : "None, you aim it by hand")
                             row("Cable to router", d.ethMbps.map { $0 >= 1000 ? "\(Int($0 / 1000)) Gbps" : "\(Int($0)) Mbps" } ?? "–")
                             row("Alerts", d.alerts.isEmpty ? "None" : d.alerts.map(\.text).joined(separator: "\n"))
@@ -72,12 +80,14 @@ struct StarlinkView: View {
                     Card("Router and Wi-Fi", subtitle: s.router.hardware.map { "Starlink Router \($0)" }) {
                         Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
                             row("Software", s.router.software ?? "–")
+                            if let u = s.router.update { row("Updates", RouterText.update(state: u.state, pending: u.pending, progress: u.progress).text) }
                             row("Up for", s.router.uptimeS.map { Format.duration(ms: $0 * 1000) } ?? "–")
                             row("Devices", "\(s.connected.count) connected · \(s.devices.count) known")
                             ForEach(s.router.networks.filter { n in !n.guest || s.devices.contains { $0.online && $0.network == "guest" } || n.domain == s.router.networks.first(where: \.guest)?.domain }) { n in
                                 row(n.guest ? "Guest Wi-Fi" : "Main Wi-Fi", Set(n.ssids.values).sorted().joined(separator: " · "))
                             }
                         }
+                        Text(RouterText.readOnly).font(.caption).foregroundStyle(.secondary)
                     }
                 }
 
@@ -112,6 +122,11 @@ struct StarlinkView: View {
                 try? await Task.sleep(for: .seconds(600))
             }
         }
+    }
+
+    private func dishUpdate(_ d: Dish) -> String {
+        let u = RouterText.update(state: d.updateState, pending: nil, progress: nil, ready: d.updateReady == true, waitS: d.updateWaitS)
+        return d.updateReady == true ? u.text + ", restart pending" : u.text
     }
 
     private func row(_ label: String, _ value: String) -> some View {

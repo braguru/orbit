@@ -26,6 +26,7 @@ MIME = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=ut
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
        "font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'")
 MAX_BODY = 16 * 1024
+PLAN_MAX_BODY = 96 * 1024  # a floor plan with many walls and devices
 DEVICE = re.compile(r"/api/devices/([0-9]{1,20})")
 DEVICE_USAGE = re.compile(r"/api/devices/([0-9]{1,20})/usage")
 DEVICE_MERGE = re.compile(r"/api/devices/([0-9]{1,20})/merge")
@@ -96,11 +97,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(400, str(e))
         self._send(200, result if result is not None else {"ok": True})
 
-    def _body(self):
+    def _body(self, limit=MAX_BODY):
         if not (self.headers.get("Content-Type") or "").startswith("application/json"):
             raise ValueError("Send JSON")
         n = int(self.headers.get("Content-Length") or 0)
-        if n > MAX_BODY:
+        if n > limit:
             raise ValueError("Too much data")
         body = json.loads(self.rfile.read(n) or b"{}")
         if not isinstance(body, dict):
@@ -130,6 +131,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._call(c.events_list, (q.get("cat") or [None])[0], (q.get("limit") or ["200"])[0])
         if path == "/api/obstruction":
             return self._call(c.obstruction_map)
+        if path == "/api/plan":
+            return self._call(c.get_plan)
         m = DEVICE_USAGE.fullmatch(path)
         if m:
             return self._call(c.device_usage, m.group(1))
@@ -146,7 +149,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._signed_in(path):
             return self._error(401, "Sign in with the access code")
         try:
-            body = self._body()
+            body = self._body(PLAN_MAX_BODY if path == "/api/plan" else MAX_BODY)
         except (ValueError, json.JSONDecodeError) as e:
             return self._error(400, str(e))
         if path == "/api/login":
@@ -158,6 +161,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._call(c.start_speedtest)
         if path == "/api/people":
             return self._call(c.add_person, body)
+        if path == "/api/plan":
+            return self._call(c.set_plan, body)
+        if path == "/api/security/tripwire":
+            return self._call(c.set_tripwire, body)
         if path == "/api/devices/bulk":
             return self._call(c.bulk_update, body)
         if path == "/api/devices/forget":

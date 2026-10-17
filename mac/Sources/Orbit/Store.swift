@@ -3,6 +3,24 @@ import Observation
 
 /// Talks to the Orbit server running on this Mac: a live stream of the whole picture every second,
 /// plus a few requests. The server does the watching and keeps the history; this app only shows it.
+/// The menu bar item: an antenna, and the latency while Starlink is online.
+struct MenuLabel: Equatable {
+    var symbol: String
+    var text: String?
+
+    static let offline = MenuLabel(symbol: "antenna.radiowaves.left.and.right.slash", text: nil)
+
+    init(symbol: String, text: String?) { self.symbol = symbol; self.text = text }
+
+    init(state: OrbitState?, live: Bool) {
+        if live, let s = state, s.dish.online == true, let lat = s.dish.latencyMs {
+            self.init(symbol: "antenna.radiowaves.left.and.right", text: "\(Int(lat.rounded())) ms")
+        } else {
+            self = .offline
+        }
+    }
+}
+
 @MainActor @Observable
 final class OrbitStore {
     enum Connection { case connecting, live, lost }
@@ -12,11 +30,17 @@ final class OrbitStore {
     var points: [Point] = []           // whole-home readings, last 2 minutes
     var deviceHistory: [String: [Double]] = [:]  // live Mbps per device, last minute
     var lastError: String?
+    /// Starts and stops the server (the background service) from this app.
+    let server = ServerControl()
+    /// What the menu bar shows. Kept apart from `state` so the status item is redrawn only when this changes:
+    /// macOS redraws a status item as a picture each time, which cost more than everything else the app did.
+    private(set) var menuLabel = MenuLabel.offline
 
     var serverURL: URL {
         URL(string: UserDefaults.standard.string(forKey: "serverURL") ?? "") ?? URL(string: "http://127.0.0.1:8787")!
     }
 
+    private var menuLabelAt = Date.distantPast
     private var streamTask: Task<Void, Never>?
     private var watchTask: Task<Void, Never>?
     private var lastMessage = Date.distantPast
@@ -35,6 +59,8 @@ final class OrbitStore {
     }()
 
     init() {
+        server.host = self
+        Task { await server.refresh() }
         connect()
         // If the stream goes quiet (the server stopped, or the Mac slept), start it again.
         watchTask = Task { [weak self] in
@@ -42,7 +68,7 @@ final class OrbitStore {
                 try? await Task.sleep(for: .seconds(3))
                 guard let self else { return }
                 if Date().timeIntervalSince(self.lastMessage) > 8 {
-                    if self.state != nil { self.connection = .lost }
+                    if self.state != nil { self.markLost() }
                     self.connect()
                 }
             }
@@ -65,7 +91,7 @@ final class OrbitStore {
                 apply(try decoder.decode(OrbitState.self, from: Data(line.dropFirst(6).utf8)))
             }
         } catch {
-            if !Task.isCancelled && state == nil { connection = .lost }
+            if !Task.isCancelled && state == nil { markLost() }
         }
     }
 
@@ -79,20 +105,42 @@ final class OrbitStore {
         state = s
         connection = .live
         lastMessage = Date()
+        server.noteLive()
+        refreshMenuLabel()
         notify(s)
+    }
+
+    /// The stream stopped. Ask macOS once whether the background service is loaded, so the app can offer to start it.
+    private func markLost() {
+        guard connection != .lost else { return }
+        connection = .lost
+        refreshMenuLabel()
+        Task { await server.refresh() }
+    }
+
+    /// The latency in the menu bar moves a few milliseconds every second, so it refreshes every few seconds;
+    /// anything bigger (going offline, coming back, the connection dropping) shows at once.
+    func refreshMenuLabel() {
+        let next = MenuLabel(state: state, live: connection == .live)
+        guard next != menuLabel else { return }
+        let sameKind = next.symbol == menuLabel.symbol
+        if sameKind, Date().timeIntervalSince(menuLabelAt) < 5 { return }
+        menuLabel = next
+        menuLabelAt = Date()
     }
 
     /// A Mac notification when a device or person uses up most or all of their allowance.
     /// Only for entries that arrive while the app runs: what was there when it connected isn't news.
     private func notify(_ s: OrbitState) {
         if !askedToNotify, Snapshot.folder == nil,
-           s.devices.contains(where: { $0.allowance != nil }) || s.people.contains(where: { $0.allowance != nil }) {
+           s.devices.contains(where: { $0.allowance != nil }) || s.people.contains(where: { $0.allowance != nil })
+            || s.security?.tripwire?.on == true {
             askedToNotify = true
             Notifier.prepare()
         }
         let newest = s.events.map(\.id).max() ?? 0
         if let last = lastEventID, askedToNotify {
-            for e in s.events.sorted(by: { $0.id < $1.id }) where e.id > last && e.cat == "usage" { Notifier.post(e) }
+            for e in s.events.sorted(by: { $0.id < $1.id }) where e.id > last && Notifier.worthAlerting(e) { Notifier.post(e) }
         }
         lastEventID = max(lastEventID ?? 0, newest)
     }
@@ -118,10 +166,15 @@ final class OrbitStore {
 
     @discardableResult
     private func post(_ path: String, _ body: [String: Any]) async throws -> Data {
+        try await post(path, json: try JSONSerialization.data(withJSONObject: body))
+    }
+
+    @discardableResult
+    private func post(_ path: String, json: Data) async throws -> Data {
         var req = URLRequest(url: url(path))
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        req.httpBody = json
         let (data, response) = try await session.data(for: req)
         try check(response, data)
         return data
@@ -146,6 +199,18 @@ final class OrbitStore {
         }
     }
 
+    /// The floor plan lives on the Orbit server, so the web page and this app share it. Orbit only keeps its own
+    /// drawing there: nothing is ever sent to the dish or the router.
+    func fetchPlan() async throws -> PlanReply { try await get("api/plan") }
+
+    /// Keeps the plan and answers with its new revision. A refusal (the server says why) is thrown.
+    func savePlan(_ plan: FloorPlan) async throws -> Int {
+        let data = try await post("api/plan", json: try JSONEncoder().encode(plan))
+        return try decoder.decode(PlanSaved.self, from: data).rev
+    }
+
+    /// The tripwire: Orbit listens on a few doors of this Mac and notes who knocks.
+    func setTripwire(_ on: Bool) { run { try await self.post("api/security/tripwire", ["on": on]) } }
     func runSpeedTest() { run { try await self.post("api/speedtest", [:]) } }
     func rename(_ id: String, to name: String) { run { try await self.post("api/devices/\(id)", ["name": name]) } }
     func assign(_ id: String, to owner: String?) { run { try await self.post("api/devices/\(id)", ["owner": owner ?? NSNull()]) } }
@@ -203,6 +268,14 @@ extension OrbitState {
         return (max(50, (dish.fastestMbps ?? 0).rounded()), "the fastest seen this week")
     }
 
+    // MARK: security
+
+    /// Contact attempts from the past hour count as happening now.
+    static let probeWindow = 3_600_000.0
+    var activeProbes: [Probe] { (security?.probes ?? []).filter { $0.known != true && now - $0.last < Self.probeWindow }.sorted { $0.last > $1.last } }
+    /// Known devices that talked to this Mac in the past hour. Allowed, so shown calmly and never as an alert.
+    var friendlyProbes: [Probe] { (security?.probes ?? []).filter { $0.known == true && now - $0.last < Self.probeWindow }.sorted { $0.last > $1.last } }
+
     var dropoutSeconds: Double { outages.reduce(0) { $0 + $1.durationS } }
 
     var health: (title: String, detail: String, tone: Tone) {
@@ -232,3 +305,27 @@ extension OrbitState {
 }
 
 enum Tone { case good, warn, bad, neutral }
+
+// MARK: - ServerHost
+
+extension OrbitStore: ServerHost {
+    var serverIsLive: Bool { connection == .live && Date().timeIntervalSince(lastMessage) < 3 }
+
+    func serverAnswers() async -> Bool {
+        var req = URLRequest(url: url("api/session"))
+        req.timeoutInterval = 2
+        do { _ = try await session.data(for: req); return true } catch { return false }
+    }
+
+    /// The server was stopped from this app: show the "stopped" screen rather than a stale picture.
+    func serverStopped() {
+        streamTask?.cancel()
+        state = nil
+        points = []
+        deviceHistory = [:]
+        connection = .lost
+        refreshMenuLabel()
+    }
+
+    func showError(_ text: String) { lastError = text }
+}

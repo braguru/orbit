@@ -15,6 +15,12 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/Orbit"
 cp Info.plist "$APP/Contents/Info.plist"
 
+# The version lives in orbit/__init__.py; stamp it in rather than keeping a copy here.
+VERSION=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' ../orbit/__init__.py)
+BUILD=$(git rev-list --count HEAD 2>/dev/null || echo 1)
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD" "$APP/Contents/Info.plist"
+
 # The app icon: draw it once, then make every size macOS wants.
 if [[ ! -f build/AppIcon.icns ]]; then
   ICONSET=build/AppIcon.iconset

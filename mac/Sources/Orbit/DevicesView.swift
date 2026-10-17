@@ -4,6 +4,7 @@ import SwiftUI
 struct DevicesView: View {
     @Environment(OrbitStore.self) private var store
     var state: OrbitState
+    @Binding var focus: String?  // set from elsewhere, such as the Overview map, to select that device
     @State private var query = ""
     @State private var selection = Snapshot.devices
     @State private var showOffline = true
@@ -51,7 +52,7 @@ struct DevicesView: View {
             TableColumn("Connection") { d in
                 HStack(spacing: 6) {
                     if d.online {
-                        if d.wired { Image(systemName: "cable.connector") } else { SignalBars(dbm: d.signal) }
+                        if d.wired { Image(systemName: "cable.connector") } else { SignalBars(dbm: d.effSignal) }
                         Text(d.connectionLabel)
                     } else {
                         Text(d.ip.map { "Last at \($0)" } ?? "Not connected").foregroundStyle(.secondary)
@@ -78,6 +79,13 @@ struct DevicesView: View {
             }
         }
         .onChange(of: shown.map(\.id)) { _, ids in selection.formIntersection(ids) }  // a device you hide leaves the selection
+        .onChange(of: focus, initial: true) { _, id in
+            guard let id else { return }
+            if state.device(id)?.isHidden == true { showHidden = true }
+            query = ""
+            selection = [id]
+            focus = nil
+        }
         .searchable(text: $query, placement: .toolbar, prompt: "Search name, IP address, owner or notes")
         .toolbar {
             ToolbarItem {
@@ -238,7 +246,10 @@ struct DeviceInspector: View {
                 if d.online && !d.wired {
                     LabeledContent("Band", value: d.bandLabel)
                     LabeledContent("Signal") {
-                        HStack { SignalBars(dbm: d.signal); Text("\(Signal(d.signal).word) (\(Int(d.signal ?? 0)) dBm)") }
+                        HStack { SignalBars(dbm: d.effSignal); Text("\(Signal(d.effSignal).word) (\(Int(d.signal ?? 0)) dBm)") }
+                    }
+                    if d.band == "2.4" {
+                        Text("2.4 GHz reaches farther, so its signal is judged 6 dB more gently than 5 GHz.").font(.caption).foregroundStyle(.secondary)
                     }
                 }
                 if let since = d.since, d.online { LabeledContent("Connected", value: Format.duration(ms: state.now - since)) }

@@ -1,29 +1,44 @@
 #!/bin/zsh
-# Run Orbit in the background on this Mac, as a LaunchAgent for your user account.
-# It starts when you log in, restarts by itself if it stops unexpectedly, and keeps
-# the Mac awake while it's plugged in (on battery it sleeps as usual).
+# Run Orbit in the background on this Mac, as a launchd service for your user account.
+# It restarts by itself if it stops unexpectedly, and keeps the Mac awake while it's
+# plugged in (on battery it sleeps as usual). It does NOT start when you log in: start it
+# with `start` below or from the Orbit Mac app. Add --login to start it at login too.
 #
-#   scripts/service.sh install [--lan]   set it up and start it (--lan: phones on your Wi-Fi can open it)
+#   scripts/service.sh install [--lan] [--login]   set it up and start it
+#                                        --lan: phones on your Wi-Fi can open it
+#                                        --login: also start it by itself whenever you log in
 #   scripts/service.sh status            is it running, and is it recording?
 #   scripts/service.sh logs              follow its log (Ctrl+C stops following, not Orbit)
 #   scripts/service.sh restart           restart it, for example after updating Orbit's code
-#   scripts/service.sh stop              stop it until you start it again or next log in
+#   scripts/service.sh stop              stop it until you start it again
 #   scripts/service.sh start             start it again after a stop
 #   scripts/service.sh uninstall         stop it and remove the background service
 set -euo pipefail
 
 LABEL=local.orbit.dashboard
 ROOT=${0:A:h:h}
-PLIST=$HOME/Library/LaunchAgents/$LABEL.plist
+# macOS starts every service file in LaunchAgents at login, so the file lives there only with --login.
+# Otherwise it sits in Orbit's own folder, and the app and this script start it by path.
+PLIST_LOGIN=$HOME/Library/LaunchAgents/$LABEL.plist
+PLIST_HOME="$HOME/Library/Application Support/Orbit/$LABEL.plist"
+if [[ -f "$PLIST_LOGIN" ]]; then PLIST=$PLIST_LOGIN; else PLIST=$PLIST_HOME; fi
 LOG=$HOME/Library/Logs/Orbit/orbit.log
 DOMAIN=gui/$(id -u)
 PY=$ROOT/.venv/bin/python
 
 loaded() { launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 }
 
+# Stopping takes a few seconds: Orbit saves what it has first, and macOS lists the service until it has gone.
+unload() {
+  launchctl bootout "$DOMAIN/$LABEL" || true
+  local i
+  for i in {1..60}; do loaded || return 0; sleep 0.5; done
+  echo "Orbit is still saving. Give it a moment, then try again."; return 1
+}
+
 write_plist() {
   local lan=""
-  [[ "${1:-}" == "--lan" ]] && lan="<string>--lan</string>"
+  [[ "$1" == *--lan* ]] && lan="<string>--lan</string>"
   mkdir -p "${PLIST:h}" "${LOG:h}"
   cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -75,10 +90,18 @@ PYEOF
 case "${1:-}" in
   install)
     [[ -x "$PY" ]] || { echo "Set up Orbit first: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"; exit 1 }
-    if loaded; then launchctl bootout "$DOMAIN/$LABEL" || true; fi
-    write_plist "${2:-}"
+    if loaded; then unload || exit 1; fi
+    rm -f "$PLIST_LOGIN" "$PLIST_HOME"
+    if [[ " $* " == *" --login "* ]]; then PLIST=$PLIST_LOGIN; else PLIST=$PLIST_HOME; fi
+    write_plist "$*"
+    launchctl enable "$DOMAIN/$LABEL" 2>/dev/null || true  # undo a switch-off in System Settings > Login Items
     launchctl bootstrap "$DOMAIN" "$PLIST"
-    echo "Orbit now runs in the background and starts by itself when you log in."
+    if [[ "$PLIST" == "$PLIST_LOGIN" ]]; then
+      echo "Orbit now runs in the background and starts by itself when you log in."
+    else
+      echo "Orbit now runs in the background. It won't start by itself when you log in:"
+      echo "start it with scripts/service.sh start or from the Orbit app (install with --login to change that)."
+    fi
     echo "Open http://localhost:8787 · log: $LOG"
     ;;
   status)
@@ -97,16 +120,21 @@ case "${1:-}" in
     echo "Restarted."
     ;;
   stop)
-    if loaded; then launchctl bootout "$DOMAIN/$LABEL"; echo "Stopped. It starts again next time you log in, or with: scripts/service.sh start"; else echo "It wasn't running."; fi
+    if loaded; then
+      unload || exit 1
+      if [[ "$PLIST" == "$PLIST_LOGIN" ]]; then echo "Stopped. It starts again next time you log in, or with: scripts/service.sh start"
+      else echo "Stopped. Start it again with: scripts/service.sh start, or from the Orbit app."; fi
+    else echo "It wasn't running."; fi
     ;;
   start)
     [[ -f "$PLIST" ]] || { echo "Not installed. Run: scripts/service.sh install"; exit 1 }
+    launchctl enable "$DOMAIN/$LABEL" 2>/dev/null || true  # undo a switch-off in System Settings > Login Items
     if loaded; then launchctl kickstart "$DOMAIN/$LABEL"; else launchctl bootstrap "$DOMAIN" "$PLIST"; fi
     echo "Started. Open http://localhost:8787"
     ;;
   uninstall)
-    if loaded; then launchctl bootout "$DOMAIN/$LABEL" || true; fi
-    rm -f "$PLIST"
+    if loaded; then unload || exit 1; fi
+    rm -f "$PLIST_LOGIN" "$PLIST_HOME"
     echo "Removed the background service. Your history in data/orbit.db is kept."
     ;;
   *)

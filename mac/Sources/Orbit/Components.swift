@@ -12,6 +12,44 @@ struct EqualRow<Content: View>: View {
     }
 }
 
+/// Lays its views out in a line, wrapping onto the next when there's no room left.
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 12
+    var lineSpacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = proposal.width ?? .infinity
+        var x: CGFloat = 0, y: CGFloat = 0, line: CGFloat = 0, widest: CGFloat = 0
+        for view in subviews {
+            let size = view.sizeThatFits(.unspecified)
+            if x > 0 && x + size.width > width {
+                x = 0
+                y += line + lineSpacing
+                line = 0
+            }
+            x += size.width + spacing
+            line = max(line, size.height)
+            widest = max(widest, x - spacing)
+        }
+        return CGSize(width: proposal.width ?? widest, height: y + line)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX, y = bounds.minY, line: CGFloat = 0
+        for view in subviews {
+            let size = view.sizeThatFits(.unspecified)
+            if x > bounds.minX && x + size.width > bounds.maxX {
+                x = bounds.minX
+                y += line + lineSpacing
+                line = 0
+            }
+            view.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
+            x += size.width + spacing
+            line = max(line, size.height)
+        }
+    }
+}
+
 /// A titled panel, like the cards on the web dashboard.
 struct Card<Content: View, Accessory: View>: View {
     var title: String
@@ -186,14 +224,35 @@ struct NotConnected: View {
     @Environment(OrbitStore.self) private var store
 
     var body: some View {
+        let server = store.server
         ContentUnavailableView {
-            Label(store.connection == .lost ? "Orbit’s server isn’t answering" : "Connecting to Orbit…", systemImage: "antenna.radiowaves.left.and.right.slash")
+            Label(title(server), systemImage: "antenna.radiowaves.left.and.right.slash")
         } description: {
-            Text(store.connection == .lost
-                 ? "This app shows what the Orbit server on this Mac records. Check it’s running with scripts/service.sh status, or start it with scripts/service.sh start."
-                 : "Asking the Orbit server on this Mac for the latest picture.")
+            VStack(spacing: 8) {
+                Text(message(server))
+                if let p = server.problem { Text(p).foregroundStyle(.red) }
+            }
         } actions: {
-            if store.connection == .lost { Button("Try again") { store.connect() } }
+            if store.connection == .lost {
+                if server.canControl { ServerStartButton() }
+                if !server.busy { Button("Try again") { store.connect() } }
+            }
         }
+    }
+
+    private func title(_ server: ServerControl) -> String {
+        if server.busy { return server.phaseText }
+        return store.connection == .lost ? (server.canControl && !server.loaded ? "Orbit is stopped" : "Orbit’s server isn’t answering") : "Connecting to Orbit…"
+    }
+
+    private func message(_ server: ServerControl) -> String {
+        guard store.connection == .lost else { return "Asking the Orbit server on this Mac for the latest picture." }
+        if server.canControl {
+            return server.loaded
+                ? "The Orbit server is loaded but not answering. It may still be starting. If this lasts, restart it."
+                : "This app shows what the Orbit server records on this Mac, and the server isn’t running. Start it here."
+        }
+        if server.isLocal { return "This app shows what the Orbit server on this Mac records. " + ServerText.notInstalled }
+        return "This app shows what the Orbit server records, and it isn’t answering. Check that the other computer is on and Orbit is running."
     }
 }

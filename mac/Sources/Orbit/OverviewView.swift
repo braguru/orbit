@@ -5,67 +5,107 @@ struct OverviewView: View {
     @Environment(OrbitStore.self) private var store
     var state: OrbitState
     @Binding var section: Page
+    var open: (String) -> Void  // shows a device on the Devices page
 
     var body: some View {
         let s = state
-        let health = s.health
         let cap = s.capacity
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("\(greeting)\(s.me.map { ", " + $0.name } ?? "") · \(Date().formatted(.dateTime.weekday(.wide).day().month(.wide)))")
-                        .font(.callout).foregroundStyle(.secondary)
-                    HStack(spacing: 10) {
-                        Circle().fill(health.tone.color).frame(width: 10, height: 10)
-                        Text(health.title).font(.system(size: 30, weight: .bold, design: .rounded))
+        GeometryReader { geo in
+            // With room, the map of devices sits beside the headline, as on the web page; otherwise below it.
+            let wide = geo.size.width >= 940
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    if wide {
+                        HStack(alignment: .top, spacing: 20) {
+                            VStack(alignment: .leading, spacing: 16) {
+                                headline
+                                if !s.newDevices.isEmpty { NewDeviceBanner(devices: s.newDevices, state: s) }
+                                tiles(perRow: 2)
+                                liveTraffic(height: 170)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            OrbitRadar(state: s, open: open)
+                                .frame(width: min(600, (geo.size.width - 68) * 7 / 12))
+                        }
+                    } else {
+                        headline
+                        if !s.newDevices.isEmpty { NewDeviceBanner(devices: s.newDevices, state: s) }
+                        tiles(perRow: 4)
+                        OrbitRadar(state: s, open: open)
+                        liveTraffic(height: 220)
                     }
-                    Text(health.detail).font(.title3).foregroundStyle(.secondary)
-                }
 
-                if !s.newDevices.isEmpty { NewDeviceBanner(devices: s.newDevices, state: s) }
+                    EqualRow(spacing: 16) {
+                        Card("Using the most right now", subtitle: "Share of ~\(Int(cap.mbps)) Mbps",
+                             accessory: { Button("All devices") { section = .devices }.buttonStyle(.link) }) {
+                            TopUsers(state: s, capacity: cap.mbps)
+                        }
+                        Card("Recent activity", accessory: { Button("See all") { section = .activity }.buttonStyle(.link) }) {
+                            EventList(events: Array(s.events.prefix(6)), now: s.now)
+                        }
+                    }
 
-                EqualRow {
-                    StatTile(icon: "timer", label: "Latency", value: s.dish.latencyMs.map { "\(Int($0.rounded()))" } ?? "–",
-                             unit: s.dish.latencyMs == nil ? "" : "ms",
-                             note: latencyNote(s.dish.latencyMs), live: s.dish.latencyMs != nil) {
-                        Sparkline(values: store.points.suffix(40).map(\.lat), maxValue: 80).frame(height: 26)
-                    }
-                    StatTile(icon: "waveform", label: "In use now", value: Format.mbps(s.dish.downMbps), unit: "Mbps",
-                             note: "of ~\(Int(cap.mbps)) Mbps, \(cap.label)", live: s.dish.online == true) {
-                        ProgressView(value: min(1, s.dish.downMbps / cap.mbps)).tint(.orbitAccent)
-                    }
-                    StatTile(icon: "arrow.up.arrow.down", label: "Data used today", value: Format.bytes(s.home.down + s.home.up),
-                             note: "↓ \(Format.bytes(s.home.down)) · ↑ \(Format.bytes(s.home.up))")
-                    StatTile(icon: "exclamationmark.triangle", label: "Dropouts, 24 h", value: "\(s.outages.count)",
-                             note: s.outages.isEmpty ? "Not one in the last 24 hours" : "\(Format.seconds(s.dropoutSeconds)) offline in total")
-                }
-
-                Card("Live traffic", subtitle: "Whole home, last 2 minutes, updated every second") {
-                    TrafficChart(points: store.points).frame(height: 220)
-                }
-
-                EqualRow(spacing: 16) {
-                    Card("Using the most right now", subtitle: "Share of ~\(Int(cap.mbps)) Mbps",
-                         accessory: { Button("All devices") { section = .devices }.buttonStyle(.link) }) {
-                        TopUsers(state: s, capacity: cap.mbps)
-                    }
-                    Card("Recent activity", accessory: { Button("See all") { section = .activity }.buttonStyle(.link) }) {
-                        EventList(events: Array(s.events.prefix(6)), now: s.now)
-                    }
-                }
-
-                EqualRow(spacing: 16) {
-                    Card("Starlink", accessory: { Button("Details") { section = .starlink }.buttonStyle(.link) }) {
-                        StarlinkGlance(state: s)
-                    }
-                    Card("Data used today, by person", subtitle: "\(Format.bytes(s.home.down + s.home.up)) for the whole home") {
-                        PersonUsage(state: s)
+                    EqualRow(spacing: 16) {
+                        Card("Starlink", accessory: { Button("Details") { section = .starlink }.buttonStyle(.link) }) {
+                            StarlinkGlance(state: s)
+                        }
+                        Card("Data used today, by person", subtitle: "\(Format.bytes(s.home.down + s.home.up)) for the whole home") {
+                            PersonUsage(state: s)
+                        }
                     }
                 }
+                .padding(24)
             }
-            .padding(24)
         }
         .navigationTitle("Overview")
+    }
+
+    private var headline: some View {
+        let s = state
+        let health = s.health
+        return VStack(alignment: .leading, spacing: 6) {
+            Text("\(greeting)\(s.me.map { ", " + $0.name } ?? "") · \(Date().formatted(.dateTime.weekday(.wide).day().month(.wide)))")
+                .font(.callout).foregroundStyle(.secondary)
+            HStack(spacing: 10) {
+                Circle().fill(health.tone.color).frame(width: 10, height: 10)
+                Text(health.title).font(.system(size: 30, weight: .bold, design: .rounded))
+            }
+            Text(health.detail).font(.title3).foregroundStyle(.secondary)
+        }
+    }
+
+    /// The four readings, in one row or two.
+    @ViewBuilder
+    private func tiles(perRow: Int) -> some View {
+        let s = state
+        let cap = s.capacity
+        let latency = StatTile(icon: "timer", label: "Latency", value: s.dish.latencyMs.map { "\(Int($0.rounded()))" } ?? "–",
+                               unit: s.dish.latencyMs == nil ? "" : "ms",
+                               note: latencyNote(s.dish.latencyMs), live: s.dish.latencyMs != nil) {
+            Sparkline(values: store.points.suffix(40).map(\.lat), maxValue: 80).frame(height: 26)
+        }
+        let inUse = StatTile(icon: "waveform", label: "In use now", value: Format.mbps(s.dish.downMbps), unit: "Mbps",
+                             note: "of ~\(Int(cap.mbps)) Mbps, \(cap.label)", live: s.dish.online == true) {
+            ProgressView(value: min(1, s.dish.downMbps / cap.mbps)).tint(.orbitAccent)
+        }
+        let today = StatTile(icon: "arrow.up.arrow.down", label: "Data used today", value: Format.bytes(s.home.down + s.home.up),
+                             note: "↓ \(Format.bytes(s.home.down)) · ↑ \(Format.bytes(s.home.up))")
+        let dropouts = StatTile(icon: "exclamationmark.triangle", label: "Dropouts, 24 h", value: "\(s.outages.count)",
+                                note: s.outages.isEmpty ? "Not one in the last 24 hours" : "\(Format.seconds(s.dropoutSeconds)) offline in total")
+        if perRow == 2 {
+            VStack(spacing: 12) {
+                EqualRow { latency; inUse }
+                EqualRow { today; dropouts }
+            }
+        } else {
+            EqualRow { latency; inUse; today; dropouts }
+        }
+    }
+
+    private func liveTraffic(height: CGFloat) -> some View {
+        Card("Live traffic", subtitle: "Whole home, last 2 minutes, updated every second") {
+            TrafficChart(points: store.points).frame(height: height)
+        }
     }
 
     private var greeting: String {

@@ -52,10 +52,21 @@ struct MenuBarView: View {
                         Text("Last: \(Int(down)) ↓ / \(Int(t.up ?? 0)) ↑ Mbps, \(Format.ago(t.ts, now: s.now))").font(.caption).foregroundStyle(.secondary)
                     }
                 }
+
+                if store.server.canControl && !store.server.busy {
+                    ServerStopButton().buttonStyle(.link).font(.caption)
+                }
             } else {
-                Label(store.connection == .lost ? "Orbit’s server isn’t answering" : "Connecting to Orbit…", systemImage: "antenna.radiowaves.left.and.right.slash")
+                let server = store.server
+                Label(server.busy ? server.phaseText : store.connection == .lost ? (server.canControl && !server.loaded ? "Orbit is stopped" : "Orbit’s server isn’t answering") : "Connecting to Orbit…",
+                      systemImage: "antenna.radiowaves.left.and.right.slash")
                     .font(.headline)
-                Text("Check it’s running: scripts/service.sh status").font(.caption).foregroundStyle(.secondary)
+                if store.connection == .lost && server.canControl {
+                    ServerStartButton()
+                    if let p = server.problem { Text(p).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true) }
+                } else if store.connection == .lost {
+                    Text(server.isLocal ? ServerText.notInstalled : ServerText.remote).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             Divider()
@@ -93,6 +104,7 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            ServerSettingsSection()
             Section {
                 TextField("Orbit server", text: $serverURL)
                     .onSubmit { store.connect() }

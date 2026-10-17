@@ -31,21 +31,17 @@ struct MenuBarLabel: View {
     var store: OrbitStore
 
     var body: some View {
-        if let s = store.state, store.connection == .live {
-            if s.dish.online == true, let lat = s.dish.latencyMs {
-                Label("\(Int(lat.rounded())) ms", systemImage: "antenna.radiowaves.left.and.right")
-                    .labelStyle(.titleAndIcon)
-            } else {
-                Image(systemName: "antenna.radiowaves.left.and.right.slash")
-            }
+        let m = store.menuLabel
+        if let text = m.text {
+            Label(text, systemImage: m.symbol).labelStyle(.titleAndIcon)
         } else {
-            Image(systemName: "antenna.radiowaves.left.and.right.slash")
+            Image(systemName: m.symbol)
         }
     }
 }
 
 enum Page: String, CaseIterable, Identifiable {
-    case overview = "Overview", devices = "Devices", people = "People", usage = "Usage", starlink = "Starlink", activity = "Activity"
+    case overview = "Overview", devices = "Devices", people = "People", usage = "Usage", starlink = "Starlink", security = "Security", floorPlan = "Floor plan", activity = "Activity"
     var id: String { rawValue }
     var icon: String {
         switch self {
@@ -54,6 +50,8 @@ enum Page: String, CaseIterable, Identifiable {
         case .people: return "person.2"
         case .usage: return "chart.bar.xaxis"
         case .starlink: return "antenna.radiowaves.left.and.right"
+        case .security: return "checkmark.shield"
+        case .floorPlan: return "square.split.2x2"
         case .activity: return "waveform.path.ecg"
         }
     }
@@ -64,13 +62,16 @@ struct MainView: View {
     @Environment(\.openURL) private var openURL
     @SceneStorage("page") private var section: Page = .overview
     @State private var showSpeedTest = false
+    @State private var focusDevice: String?  // a device to show on the Devices page, picked elsewhere
 
     var body: some View {
         @Bindable var store = store
+        @Bindable var server = store.server
         NavigationSplitView {
             List(Page.allCases, selection: Binding(get: { section }, set: { if let v = $0 { section = v } })) { s in
                 Label(s.rawValue, systemImage: s.icon)
-                    .badge(s == .devices ? store.state?.newDevices.count ?? 0 : 0)
+                    .badge(s == .devices ? store.state?.newDevices.count ?? 0 : s == .security ? store.state?.probeSourceCount ?? 0 : 0)
+                    .badgeProminence(s == .security ? .increased : .standard)
                     .tag(s)
             }
             .navigationSplitViewColumnWidth(min: 180, ideal: 200)
@@ -78,11 +79,13 @@ struct MainView: View {
         } detail: {
             if let s = store.state {
                 switch section {
-                case .overview: OverviewView(state: s, section: $section)
-                case .devices: DevicesView(state: s)
+                case .overview: OverviewView(state: s, section: $section, open: { id in focusDevice = id; section = .devices })
+                case .devices: DevicesView(state: s, focus: $focusDevice)
                 case .people: PeopleView(state: s)
                 case .usage: UsageView(state: s)
                 case .starlink: StarlinkView(state: s, showSpeedTest: $showSpeedTest)
+                case .security: SecurityView(state: s, open: { id in focusDevice = id; section = .devices })
+                case .floorPlan: FloorPlanView(state: s, open: { id in focusDevice = id; section = .devices })
                 case .activity: ActivityView(state: s)
                 }
             } else {
@@ -92,6 +95,7 @@ struct MainView: View {
         .toolbar {
             ToolbarItemGroup {
                 ConnectionPill()
+                ServerMenu()
                 Button { showSpeedTest = true } label: { Label("Speed test", systemImage: "speedometer") }
                     .help("Run a speed test")
                     .disabled(store.state == nil)
@@ -100,18 +104,38 @@ struct MainView: View {
             }
         }
         .sheet(isPresented: $showSpeedTest) { SpeedTestSheet().environment(store) }
+        .confirmationDialog("Stop the Orbit server?", isPresented: $server.askToStop, titleVisibility: .visible) {
+            Button("Stop Orbit", role: .destructive) { Task { await store.server.stop() } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(ServerText.stopWarning)
+        }
         .task {
+            // Development aid: ORBIT_START_PAGE=Security opens on that page, for measuring what a page costs at rest.
+            if let start = ProcessInfo.processInfo.environment["ORBIT_START_PAGE"], let page = Page(rawValue: start) { section = page }
             guard let folder = Snapshot.folder else { return }
-            try? await Task.sleep(for: .seconds(4))
+            try? await Task.sleep(for: .seconds(1))
+            Snapshot.resizeWindow()
+            try? await Task.sleep(for: .seconds(3))
             for page in Page.allCases {
                 section = page
                 try? await Task.sleep(for: .seconds(3))
-                Snapshot.window(to: "\(folder)/\(page.rawValue.lowercased()).png")
-                if page == .devices && !Snapshot.devices.isEmpty {  // the rest of the inspector, too
+                let name = page.rawValue.lowercased().replacingOccurrences(of: " ", with: "-")
+                Snapshot.window(to: "\(folder)/\(name).png")
+                if page == .starlink {  // the middle of the long page, too
+                    Snapshot.scrollToEnd(fraction: 0.45)
+                    try? await Task.sleep(for: .seconds(1))
+                    Snapshot.window(to: "\(folder)/starlink-mid.png")
+                }
+                if (page == .devices && !Snapshot.devices.isEmpty) || page == .security || page == .floorPlan || page == .starlink {  // the rest of the inspector, too
                     Snapshot.scrollToEnd()
                     try? await Task.sleep(for: .seconds(1))
-                    Snapshot.window(to: "\(folder)/devices-end.png")
+                    Snapshot.window(to: "\(folder)/\(name)-end.png")
                 }
+            }
+            if let hold = ProcessInfo.processInfo.environment["ORBIT_SNAPSHOT_HOLD"], let page = Page(rawValue: hold) {
+                section = page  // stay on this page, for measuring what it costs at rest
+                return
             }
             NSApp.terminate(nil)
         }

@@ -14,3 +14,6 @@ mac/.build/
 # Claude Code: per-person settings, and the worktrees its sessions make here
 .claude/settings.local.json
 .claude/worktrees/
+
+# Release artifacts built by scripts/release.sh
+/build/

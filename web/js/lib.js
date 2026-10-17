@@ -72,6 +72,10 @@ export const TYPES = {
   unknown: { icon: 'circle-help', label: 'Unknown device' },
 };
 export const typeIcon = d => (TYPES[d.type] || TYPES.unknown).icon;
+/* 2.4 GHz reaches farther and fades more slowly, so the same dBm is a better sign on it than on 5 GHz.
+   Every judgement of a device's signal uses this adjusted level, so the labels, bars and radar rings agree. */
+export const BAND_EASE_DB = 6;
+export const effSignal = d => (d.signal == null ? null : d.signal + (d.band === '2.4' ? BAND_EASE_DB : 0));
 export function signalInfo(dbm) {
   if (dbm == null) return { level: 4, word: 'Wired', tone: 'good' };
   if (dbm >= -55) return { level: 4, word: 'Excellent', tone: 'good' };
@@ -82,7 +86,7 @@ export function signalInfo(dbm) {
 export const isWired = d => d.band === 'eth';
 export const bandLabel = d => (isWired(d) ? 'Ethernet' : d.band ? d.band + ' GHz' : 'Wi-Fi');
 export const netLabel = d => (isWired(d) ? 'Wired' : d.network === 'guest' ? 'Guest Wi-Fi' : 'Main Wi-Fi');
-export const connLabel = d => (isWired(d) ? 'Wired · Ethernet' : `${d.network === 'guest' ? 'Guest · ' : ''}${bandLabel(d)} · ${signalInfo(d.signal).word}`);
+export const connLabel = d => (isWired(d) ? 'Wired · Ethernet' : `${d.network === 'guest' ? 'Guest · ' : ''}${bandLabel(d)} · ${signalInfo(effSignal(d)).word}`);
 export const personOf = (people, id) => (id ? people.find(p => p.id === id) || null : null);
 export const pcol = p => `var(--p-${p.color})`;
 export const scol = p => `var(--s-${p.color})`;
@@ -145,7 +149,7 @@ export function Glyph({ d, people, size = '' }) {
 }
 export function Bars({ d }) {
   if (isWired(d)) return html`<${Icon} name="ethernet-port" size=${15} />`;
-  const s = signalInfo(d.signal);
+  const s = signalInfo(effSignal(d));
   return html`<span className=${'bars t-' + s.tone} aria-hidden="true">${[1, 2, 3, 4].map(i => html`<i key=${i} className=${i <= s.level ? 'on' : ''} />`)}</span>`;
 }
 export function StatusChip({ d }) {

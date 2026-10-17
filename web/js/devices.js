@@ -2,7 +2,7 @@
 import {
   html, useState, useEffect, useRef, Fragment, sum, enterKey, readPref, writePref, fmtMbps, fmtBytes, fmtDur, fmtAgo,
   fmtClock, fmtDate, fmtWeekday, fmtLimit, Icon, Glyph, Bars, StatusChip, Spark, Seg, AssignMenu, TypeMenu, Switch,
-  AllowanceMeter, AllowanceEditor, CopyBtn, UsageBars, Modal, trapTab, personOf, devColor, ownerLabel, ownName, signalInfo,
+  AllowanceMeter, AllowanceEditor, CopyBtn, UsageBars, Modal, trapTab, personOf, devColor, ownerLabel, ownName, signalInfo, effSignal,
   bandLabel, netLabel, connLabel, statusDetail, isWired, PERIOD, TYPES,
 } from './lib.js';
 import { usePoll } from './data.js';
@@ -176,7 +176,7 @@ function NewDeviceBanner({ d, s, api, ui }) {
   }
   return html`<div className="banner warn"><span className="banner-ic"><${Icon} name="shield-alert" size=${17} /></span>
     <div className="grow"><div className="banner-title">Do you recognize this device?</div>
-      <div className="banner-body">It first joined ${fmtAgo(d.first_seen, s.now)}, on ${netLabel(d).toLowerCase()}. ${d.signal != null && d.signal < -72 ? 'Its weak signal suggests it’s far away, maybe outside your home. ' : ''}If nobody knows it, change your Wi-Fi password in the Starlink app.</div>
+      <div className="banner-body">It first joined ${fmtAgo(d.first_seen, s.now)}, on ${netLabel(d).toLowerCase()}. ${d.signal != null && effSignal(d) < -72 ? 'Its weak signal suggests it’s far away, maybe outside your home. ' : ''}If nobody knows it, change your Wi-Fi password in the Starlink app.</div>
       <div className="row wrap" style=${{ marginTop: '10px' }}><${AssignMenu} people=${s.people} onPick=${pid => api.assign(d.id, pid)} label="It’s ours" /><button type="button" className="btn btn-sm" onClick=${() => api.acknowledge(d.id)}>It’s fine</button></div></div></div>`;
 }
 
@@ -193,7 +193,7 @@ export function DeviceDrawer({ id, s, devHist, api, ui }) {
   }, [id]);
   if (!d) return null;
   const p = personOf(s.people, d.owner);
-  const sig = signalInfo(d.signal);
+  const sig = signalInfo(effSignal(d));
   const t = TYPES[d.type] || TYPES.unknown;
   const commit = () => {
     const v = name.trim();
@@ -241,7 +241,8 @@ export function DeviceDrawer({ id, s, devHist, api, ui }) {
             <div>Network</div><div>${netLabel(d)}${d.ssid ? html` <span className="muted">· ${d.ssid}</span>` : null}</div>
             ${!isWired(d) && d.online ? html`<${Fragment}><div>Band</div><div>${bandLabel(d)}${d.upper_band ? ' · upper channels' : ''}${d.width ? ` · ${d.width} MHz wide` : ''}</div>
               <div>Signal</div><div><span className="row" style=${{ gap: '8px' }}><${Bars} d=${d} />${sig.word} <span className="muted tnum">(${d.signal} dBm)</span></span>
-                ${sig.level <= 2 ? html`<div className="muted" style=${{ fontSize: '13px', marginTop: '4px' }}>${d.band === '5' ? 'Move it closer to the router. 2.4 GHz reaches further through walls, if the device lets you pick.' : 'Move it closer to the router for a steadier connection.'}</div>` : null}</div><//>` : null}
+                ${sig.level <= 2 ? html`<div className="muted" style=${{ fontSize: '13px', marginTop: '4px' }}>${d.band === '5' ? 'Move it closer to the router. 2.4 GHz reaches further through walls, if the device lets you pick.' : 'Move it closer to the router for a steadier connection.'}</div>` : null}
+                ${d.band === '2.4' ? html`<div className="muted" style=${{ fontSize: '13px', marginTop: '4px' }}>2.4 GHz reaches farther, so its signal is judged 6 dB more gently than 5 GHz.</div>` : null}</div><//>` : null}
             ${d.online && (d.rate_down || d.rate_up) ? html`<${Fragment}><div>Link speed</div><div className="tnum">↓ ${Math.round(d.rate_down || 0)} · ↑ ${Math.round(d.rate_up || 0)} Mbps <span className="muted">right now</span></div><//>` : null}
             <div>${d.online ? 'Connected' : 'Last seen'}</div><div>${d.online ? (d.since ? `${fmtDur(s.now - d.since)} (since ${fmtClock(d.since)})` : 'Yes') : fmtAgo(d.last_seen || s.now, s.now)}</div>
           </div>

@@ -134,6 +134,73 @@ function OutagesCard({ s }) {
   </section>`;
 }
 
+/* Shared by the cards below. Latency words are for everyday use and games alike; drops are the share of test pings that got no answer. */
+const latTone = ms => (ms == null ? '' : ms < 50 ? 'good' : ms < 100 ? 'warn' : 'crit');
+const latWord = ms => (ms == null ? 'Not measured' : ms < 50 ? 'Great' : ms < 100 ? 'Fine' : 'Slow');
+const dropTone = f => (f == null ? '' : f < 0.02 ? 'good' : f < 0.05 ? 'warn' : 'crit');
+const pct = f => (f * 100).toFixed(f > 0 && f < 0.1 ? 1 : 0) + '%';
+const fmtMs = ms => (ms == null ? '–' : ms < 10 ? ms.toFixed(1) : Math.round(ms)) + ' ms';
+const noteStyle = { fontSize: '13px', marginTop: '12px' };
+
+/* Software update, in plain words. state is the raw word from the dish or router; progress runs 0 to 1. */
+function updateWords({ state, pending, progress, ready, waitS }) {
+  if (ready) return 'Installed and waiting for a restart';
+  const st = String(state || '');
+  if (waitS != null && waitS > 0) return 'Ready, waiting for the overnight slot';
+  if (pending && progress > 0 && progress < 1) return `Downloading ${Math.round(progress * 100)}%`;
+  if (pending) return 'Update on its way';
+  if (/FETCH|DOWNLOAD/i.test(st)) return progress > 0 && progress < 1 ? `Downloading ${Math.round(progress * 100)}%` : 'Downloading an update';
+  if (/REBOOT|PENDING|READY|INSTALL/i.test(st)) return 'Ready to install';
+  if (!st || /^(IDLE|NO_UPDATE_REQUIRED|UP_TO_DATE)$/i.test(st)) return 'Up to date';
+  const w = st.replace(/_/g, ' ').toLowerCase();
+  return w.charAt(0).toUpperCase() + w.slice(1);
+}
+
+function ChainStep({ n, name, sub, ms, drop }) {
+  return html`<div className="setting"><div className="setting-text"><div className="setting-title">${n}. ${name}</div><div className="setting-sub">${sub}</div></div>
+    <div className="chips">${ms == null ? html`<span className="chip chip-muted">Not measured</span>` : html`<span className=${'chip chip-' + latTone(ms)}>${latWord(ms)} · <span className="tnum">${fmtMs(ms)}</span></span>`}
+      ${drop == null ? null : html`<span className=${'chip chip-' + dropTone(drop)}><span className="tnum">${pct(drop)}</span> lost, last 5 min</span>`}</div></div>`;
+}
+
+/* Router to dish, dish to Starlink's ground gateway, then the internet. Each is measured from the router, so each step includes the ones before it. */
+function ConnectionChain({ s }) {
+  const l = s.router.link;
+  if (!l) return null;
+  const poe = l.poe || {};
+  return html`<section className="card">
+    <div className="card-head"><div><h2 className="card-title">Connection chain</h2><div className="card-sub">Your router tests each step from your home to the internet</div></div></div>
+    <${ChainStep} n=${1} name="Router to dish" sub="The cable on your roof. This part is at home." ms=${l.dish_ms} drop=${l.dish_drop_5m} />
+    <${ChainStep} n=${2} name="To Starlink’s ground gateway" sub="Up to a satellite and back down to Starlink’s station." ms=${l.pop_ms} drop=${l.pop_drop_5m} />
+    <${ChainStep} n=${3} name="To the internet" sub="All the way out to a test server." ms=${l.internet_ms} drop=${l.internet_drop_5m} />
+    <p className="muted" style=${{ fontSize: '13px', margin: '4px 0 6px' }}>If the first step is slow, the problem is at home. If a later step is slow, it’s Starlink or beyond. Each step counts the time of the ones before it.</p>
+    <div className="kv">
+      <div>Same public address for</div><div>${l.public_ip_age_s != null ? fmtDur(l.public_ip_age_s * 1000) : '–'}<div className="muted" style=${{ fontSize: '13px' }}>Your address on the internet. It changes now and then, and Orbit tells you when it does.</div></div>
+      <div>Power to the dish</div><div>${poe.on == null ? '–' : poe.on ? `On${poe.power_w ? `, ${poe.power_w.toFixed(1)} W` : ''}` : 'Off'}${poe.faults ? html` <span className="chip chip-crit">${plural(poe.faults, 'fault')}</span>` : null}</div>
+      <div>Router to dish link</div><div>${l.no_wan_link ? html`<span className="chip chip-crit">No link. Check the cable</span>` : 'Connected'}</div>
+    </div>
+  </section>`;
+}
+
+function PointingCard({ s }) {
+  const d = s.dish, p = d.pointing, gps = d.gps, chk = d.check;
+  if (!p && !gps && !chk) return null;
+  const side = p ? Math.abs(p.az - p.want_az) : null, up = p ? Math.abs(p.el - p.want_el) : null;
+  const off = p ? Math.hypot(side, up) : 0;
+  const test = chk && chk.self_test;
+  return html`<section className="card">
+    <div className="card-head"><div><h2 className="card-title">Dish pointing</h2><div className="card-sub">Where the dish aims compared with the best direction</div></div>
+      ${p ? html`<span className=${'chip ' + (off > 15 ? 'chip-warn' : 'chip-good')}>${off > 15 ? 'Quite far off' : 'Close enough'}</span>` : null}</div>
+    <div className="kv">
+      ${p ? html`<${Fragment}><div>Sideways gap</div><div className="tnum">${side.toFixed(1)}°</div>
+        <div>Up and down gap</div><div className="tnum">${up.toFixed(1)}°</div>
+        <div>Position</div><div>${p.settled ? 'Settled' : 'Still settling'}</div><//>` : null}
+      <div>GPS</div><div>${gps ? (gps.valid ? `Locked on ${plural(gps.sats || 0, 'satellite')}` : 'No lock yet') : '–'}</div>
+      <div>Self-test</div><div>${test ? html`<span className=${'chip ' + (/PASS/i.test(test) ? 'chip-good' : 'chip-warn')}>${/PASS/i.test(test) ? 'Passed' : test.toLowerCase()}</span>` : '–'}${chk && chk.codes && chk.codes.length ? html`<div className="muted" style=${{ fontSize: '13px' }}>${chk.codes.join(', ').toLowerCase().replace(/_/g, ' ')}</div>` : null}</div>
+    </div>
+    <p className="muted" style=${noteStyle}>${d.actuated ? 'This dish has motors and adjusts itself, so the gap should be small.' : 'Standard dishes without motors can’t adjust, so some gap is common.'} It matters only if you see weak signal or dropouts.${off > 15 ? ' The gap is large, so check the sky view above for blocked patches.' : ''}</p>
+  </section>`;
+}
+
 function DishCard({ s }) {
   const d = s.dish;
   const sleep = d.sleep || {};
@@ -141,7 +208,9 @@ function DishCard({ s }) {
     <div className="card-head"><div><h2 className="card-title">Dish</h2><div className="card-sub">${kitName(d)}${d.hardware ? ` · ${d.hardware}` : ''}</div></div><${DishChip} dish=${d} /></div>
     <div className="kv">
       <div>Software</div><div className="mono">${d.software || '–'}</div>
-      <div>Updates</div><div>${d.update_hour != null ? `Installs overnight, around ${clockOfMinutes(d.update_hour * 60)}` : 'Automatic'}</div>
+      <div>Updates</div><div>${updateWords({ state: d.update_state, ready: d.update_ready, waitS: d.update_wait_s })}${d.update_ready ? html` <span className="chip chip-warn">Restart pending</span>` : null}
+        <div className="muted" style=${{ fontSize: '13px' }}>${d.update_hour != null ? `Installs overnight, around ${clockOfMinutes(d.update_hour * 60)}` : 'Installs automatically'}</div></div>
+      <div>3-day update delay</div><div>${d.deferral == null ? '–' : d.deferral ? 'On. Updates wait up to 3 days' : 'Off'}</div>
       <div>Up for</div><div>${d.uptime_s ? fmtDur(d.uptime_s * 1000) : '–'}</div>
       <div>Snow melt</div><div>${SNOW[d.snow_melt] || d.snow_melt || '–'}</div>
       <div>Sleep schedule</div><div>${sleep.on && sleep.duration_min ? `On, ${clockOfMinutes(sleep.start_min)} to ${clockOfMinutes(sleep.start_min + sleep.duration_min)}` : 'Off'}</div>
@@ -150,7 +219,7 @@ function DishCard({ s }) {
       <div>Speed limit</div><div>${!d.dl_limit || d.dl_limit === 'NO_LIMIT' ? 'None' : d.dl_limit.replace(/_/g, ' ').toLowerCase()}</div>
       <div>Alerts</div><div>${d.alerts.length ? d.alerts.map(a => html`<div key=${a.key}>${a.text}</div>`) : 'None'}</div>
     </div>
-    <p className="muted" style=${{ fontSize: '13px', marginTop: '12px' }}>To change these, use the Starlink app. Orbit only reads from your dish for now.</p>
+    <p className="muted" style=${{ fontSize: '13px', marginTop: '12px' }}>Orbit shows what your dish is set to. Change it in the Starlink app.</p>
   </section>`;
 }
 
@@ -164,6 +233,7 @@ function RouterCard({ s }) {
       ${r.reachable === false ? html`<span className="chip chip-crit">Not answering</span>` : html`<span className="chip chip-good"><span className="dot" />Online</span>`}</div>
     <div className="kv">
       <div>Up for</div><div>${r.uptime_s ? fmtDur(r.uptime_s * 1000) : '–'}</div>
+      ${r.update ? html`<${Fragment}><div>Software</div><div><span className="mono">${r.update.running || r.software || '–'}</span><div className="muted" style=${{ fontSize: '13px' }}>${updateWords({ state: r.update.state, pending: r.update.pending, progress: r.update.progress })}</div></div><//>` : null}
       <div>Devices</div><div>${s.devices.filter(d => d.online).length} connected · ${s.devices.length} known</div>
       ${nets.map(n => html`<${Fragment} key=${n.domain}><div>${n.guest ? 'Guest Wi-Fi' : 'Main Wi-Fi'}</div>
         <div>${n.names.join(' · ') || '–'}<div className="muted" style=${{ fontSize: '13px' }}>${plural(n.devs.length, 'device')} on it now${n.guest && n.isolated ? '. Devices on it can’t see your other devices' : ''}</div></div><//>`)}
@@ -214,6 +284,8 @@ export function StarlinkView({ s, x, points, ui }) {
       <div className="s-7"><${OutagesCard} s=${s} /></div>
       <div className="s-6"><${DishCard} s=${s} /></div>
       <div className="s-6"><${RouterCard} s=${s} /></div>
+      <div className="s-6"><${ConnectionChain} s=${s} /></div>
+      <div className="s-6"><${PointingCard} s=${s} /></div>
       <div className="s-12"><${SpeedTests} s=${s} ui=${ui} /></div>
     </div>
   </div>`;
